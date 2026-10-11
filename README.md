@@ -1,13 +1,6 @@
 # ⚒️ DeepSeek Harness AI 驱动专业逆向工作台（无限五代 ∞ IG5）v1.0.0
 （本工具仅限用于合法授权的软件逆向工程、安全审计与学术研究）
 
-本轮重构继续保持 **1.0.0**：抽出公共 worker 通信与内存仿真核心，维护固定版本的 Ghidra / x64dbg 源码构建，增加真实硬件断点回归，并优化手机宽度下的工作台。完整 Windows 包包含本地运行依赖，无需用户另行安装 Java、Python 或调试器。
-
-**随包能力范围**：默认 `Reverse · 内置` 使用五代自有分析通道与随包 Ghidra 数据库服务，38 个工具入口均有随包执行链；普通安装无需本机商业引擎。IG5 自有 PE/ELF 加载、CFG、局部 IR 规则与 RTTI，接入源码构建的 SLEIGH / 原生 C 反编译核心；`ig5_ir level=kernel action=decompile` 无需打开数据库或启动 Java 即可输出真实 C。微码入口提供实际分阶段 p-code 与临时规则优化，脚本入口提供原生 Ghidra API 和明确的常用旧 Python API 兼容子集；两者均保留真实来源和边界。`ig5_sync` 可在内置 Reverse 与 Ghidra 的两个独立数据库间审批复制。实现、预算和验证见 [内核说明](docs/SELF_CONTAINED_KERNEL.md)。旧发行附件不会自动获得本轮实现。
-
-随包公开目录验收已实际通过 **38/38** 入口及 **12** 个审批门，覆盖脚本事务与异常回滚、分阶段 p-code、两个独立数据库的同步，以及 x64dbg 真实断点/寄存器/单步/停止。受测为生成 PE 样本对；完整 SDK、界面和安装校验另有独立回归，不将这份结果外推为任意样本都能自动分析。
-
-解密/配置提取与协议分析使用 `ig5_crypto`、`ig5_protocol`、独立有界数据 worker 和可复用 SHA-256 产物引用，完整工具面为 **38 项**、原生技能为 **7 个**。新增 `recover` 自动恢复 XOR 密钥、检索并验证 AES 候选材料；新增 `infer` 推断未知报文的分帧、长度与字段候选。统计候选与认证/独立验证分开记录，预算、歧义和未识别部分明确保留。
 
 首次使用：从 [Windows x64 完整包发布页](https://github.com/Minglink/dsh-infinite-gen-5/releases/latest) 下载完整 Windows ZIP → 完整解压 → 运行 & .\plugin\install.ps1 → 重启 DSH → /ig5 engines → /ig5 open --engine ghidra <路径>。完整包默认离线安装；旧附件不会自动获得新安装器修复。使用 [最新源码 ZIP](https://github.com/Minglink/dsh-infinite-gen-5/archive/refs/heads/master.zip) 或 git clone 时，可在源码根目录运行 & .\install.ps1，安装器检查源码与 DSH profile 后下载固定资产，只补齐运行时和上游源码，保留当前代码。高级功能通过 /ig5 toolset full 展开。
 
@@ -99,7 +92,7 @@ Core8 保持不变。`ig5_decompile style=dossier` 在同一静态会话与数�
 
 ---
 
-## 🌟 核心高阶技术亮点
+## 🌟 核心技术亮点
 
 ### 1. 交互式 SVG 控制流图 (CFG) 与变量切片
 * **富交互画布**：工作台内置高性能原生 SVG 渲染引擎，支持鼠标平移（Pan）、滚轮缩放（Zoom），清晰标明分支与回边。
@@ -164,137 +157,10 @@ Core8 保持不变。`ig5_decompile style=dossier` 在同一静态会话与数�
 & .\plugin\install.ps1 -RepairAssets -DistributionArchive 'D:\IG5-1.0.0-Windows-x64-dsh021-full-20261010.zip' -Offline
 ```
 
-**旧发行包的安装器没有这些新参数。** 遇到旧包校验错误，请重新下载最新源码，执行上面的源码 `-DistributionArchive` 命令，保留原始 ZIP 作为校验供体。不要把新 `install.ps1` 复制进旧包：那会改变外层清单登记的核心代码，使校验继续失败。
-
 SHA-256 不符时保留报错中的相对路径、Expected/Actual SHA-256 和文件大小，并核对原始 ZIP 哈希；当前证据不能确定其他用户文件变化的原因，不能直接归咎某种解压工具。不要改清单、跳过校验或只补空 JSON。安装成功后 profile 的 `node_modules/dsh-infinite-gen-5` 应指向 `.dsh/plugins/dsh-infinite-gen-5` 的完整目录；未完成安装而保留的普通 npm 源码副本没有运行时。完全退出并重启 DSH 后，以 `/ig5 engines` 和 `ig5_doctor engine=ghidra` 验证新副本。维护者资产重建步骤见 [BUILD](docs/BUILD.md)。
 
 ---
 
-## 三引擎工程与跨引擎修改计划
-
-v1.0.0 保留同一工具面，通过 `engine=reverse|ghidra` 选择静态来源；`backend=x64dbg` 选择独立动态后端。内置 Reverse 与显式 Ghidra 的实际 `provider=ghidra` 均可按能力读取 raw/high p-code；`ig5_microcode` 返回实际 stage 与兼容 maturity 映射，不与商业扩展的专属微码成熟度等同。先用 `ig5_profile toolset=full` 启用高级工具；支持 scoped API 时只作用当前 agent，旧宿主明确报告插件实例作用域。两种切换都不持久化、不授权样本执行、不豁免写审批。
-
-每个会话返回 engine、projectId、artifactId、attachmentId 与 dbRevision。SHA-256 识别样本内容，路径移动可关联原 artifact；新内容形成新 artifact。两引擎数据库独立，活跃数据库不暗中跨 session 共享。工作台按 session key + 路径 + 引擎选择并显示来源；原生地址跳转还绑定样本身份。64 位 VA/RVA/file/runtime 地址保持十六进制字符串，只有明确基址与已加载映射才转换，BSS 不伪造文件偏移。运行地址还需 runId、moduleLoadEpoch、stopSeq，不能复用旧暂停上下文。
-
-v1.0.0 修复工程锁崩溃恢复、物理数据库别名排他、双向地址映射歧义和运行态页旧快照串目标的问题。文件锁按 PID、进程创建身份与 nonce 核验；活锁或无法确认的旧格式锁保持拒绝写入，不按年龄猜测删除。数据库硬链接与目录别名保持同一修订和排他 attachment，已注册但尚未创建的数据库路径仍受支持。file/RVA 转换要求来源和目的均唯一，重叠映射拒绝转换。
-
-锁的正常释放和崩溃恢复均保留 `.projects-stale-lock-<nonce>/owner.json` 小记录，防止延迟恢复者误移新锁；当前不自动清理。仅在确认宿主及相关 worker 全部停止后维护清理这些历史目录。未知 `projects.lock` 需先核实无存活所有者，再人工移走，不能在运行中直接删除。
-
-数据库 attachment 另记录宿主及 worker 的 PID、OS 创建身份与 nonce。崩溃恢复只在两个原所有者都确认退出时释放；存活、未知或旧格式 owner 保持占用。正常会话的异步 kill/断管不会提前释放租约，需实际退出或确认数据库 close。原生 JSONL 接收限制单行 16 MiB、累计缓冲 32 MiB，处理器配置前最多 256 条/8 MiB；超限清空待办并回收所属 worker。
-
-审计页采用异步字节游标，默认扫描预算 4 MiB，单行最多 2 MiB；允许正常追加，拒绝同大小改写/替换/截断，但不提供恶意历史改写的完整性链。大历史可能返回未知 total、partial 和 nextCursor。分析历史 active/archived 索引每批最多 10,000 个目录项/16 MiB，单 metadata 最多 8 KiB，最多缓存 100,000 条；未完成显示 partial，后续刷新继续扫描。`ig5_profile history={action:stats}` 查询，archive/restore 携带结果 UUID 列表；报告、blob 和 key refs 保留，归档不回收磁盘。目录替换与选中缓存 metadata 改写拒绝。
-
-补丁导出核对当前样本 hash/engine、数据库和映射，排除旧样本记录，无法绑定的 legacy 补丁历史明确拒绝；不沿用替换样本的历史 offset。最多 16,384 个审计范围/8 MiB，changes report 最多 4 MiB；二进制和报告独占暂存后 rename，拒绝链接输出目录、避免写穿旧报告 hardlink。两个文件非原子提交，失败需检查 partial 证据。
-
-以下为同一文件分别打开后的调用示例，地址与计划 ID 需替换为实际证据：
-
-```text
-ig5_open path="C:\samples\app.exe" engine=reverse
-ig5_open path="C:\samples\app.exe" engine=ghidra analysis_profile=interactive analysis_timeout=120
-ig5_ir target="C:\samples\app.exe" engine=ghidra ea=0x140001000 level=high max_instructions=120
-ig5_sync action=preview target="C:\samples\app.exe" source_engine=reverse destination_engine=ghidra selections=[{"kind":"rename","rva":"0x1000"},{"kind":"comment","rva":"0x1000"},{"kind":"patch","rva":"0x1010","size":2}]
-ig5_sync action=apply target="C:\samples\app.exe" plan_id="<preview返回的ID>" plan_digest="<已审阅digest>"
-```
-
-`ig5_sync` 的 preview/apply 都经过宿主审批，只在同 hash 两个数据库间单向复制显式选中的名称、行尾注释和字节，不自动全量同步或同步类型。apply 重新核对 hash、attachment、修订与所有前后值，两个数据库修改队列共同加锁。部分失败返回 applied/remaining、`atomic=false`；remaining 是未确认项，失败项也可能已提交，应查看 `failed.committed/saved/recoveryRequired` 并恢复目的数据库，不能直接重试。已尝试计划不可重放，需要重新 preview，没有跨引擎全局 Undo。普通写工具的 `expected_revision` 可拒绝过期计划；补丁 `expected` 可选，建议显式提供，提供后必须前置比较。
-
-结构体参数使用 `action=define|get|list|apply`，调试使用 `op`。结构编辑器仅插入含 target/engine 的可编辑 composer 草稿，保留现有输入，不自动发送；用户发送并审批后才生效。CFG 双击、字符串引用和调用关系可原生跳转；Ghidra 页显示真实 p-code；运行态页只读最近 x64dbg 缓存，不执行 RPC。审计按目标和引擎分页、刷新，sync 归属目的引擎，文本转义避免 HTML 注入。
-
-### 自包含 runtime、上游源码与离线安装
-
-完整发行包的插件根目录直接包含 `runtimes/ghidra` 与 `runtimes/x64dbg`。Ghidra 包含自身 JDK/Python，x64dbg 包含自身 Python、x86/x64 debugger 与自建 `ig5-native` bridge；默认安装直接带入插件，运行不依赖外部 `~\.dsh\ig5\runtimes`，不改全局 Python、系统 PATH 或引擎 site-packages。Windows 桥接在导入 PyGhidra/JPype 前注册进程局部 JDK DLL 目录，并从随包 JDK 绝对加载、验证三份 VC 运行库。默认 `engine=reverse`、`reverseProvider=bundled` 使用内置服务；`engine=ghidra` 使用另一个独立数据库车道，保留不同 attachment 和修订。`reverse:false` 只关闭可选商业探测，不关闭内置核心。`runtimeRoot`、`ghidraRuntime` / `IG5_GHIDRA_RUNTIME`、`x64dbgRuntime` / `IG5_X64DBG_RUNTIME` 保留显式外置覆盖；错误配置明确拒绝。默认运行时根按已加载插件的物理目录解析，支持 DSH profile Junction；不会借用其他版本目录。`projectRoot` 与可写工程缓存仍与分发资产分开。完整配置见 [HARNESS_PLUGIN.md](HARNESS_PLUGIN.md#安装与便携-runtime)。
-
-**五代独立内核已随代码提供。** `adapters/kernel/native/ig5_decompiler.dll` 包含源码构建的原生反编译管线，与 IG5 自有加载器一起运行；通过 `ig5_ir level=kernel` 使用，处理器规格与 Python 来自随包资产。它不需要商业 Reverse，支持的范围、真实 C 输出与未恢复信息见 [内核说明](docs/SELF_CONTAINED_KERNEL.md)。
-
-**可选商业扩展**：仅在显式 `reverseProvider=commercial` 时使用已有本机授权安装，程序及许可不随包。可设置 `idaDir` / `IG5_IDA_DIR` 与 `pythonExe` / `IG5_PYTHON`；“已发现，待验证”仅表示文件检查，需 `ig5_doctor engine=reverse` 核验启动。默认安装显示内置核心状态，缺少商业安装不会影响它。内置 Python 兼容子集和 p-code 阶段不是完整专属 API 实现。
-
-```powershell
-# 完整包内直接离线安装，不需要另跑 setup
-.\install.ps1
-# 维护者重新生成含文件 SHA-256 清单的自包含目录
-.\scripts\package_portable.ps1
-```
-
-`setup_ghidra_runtime.ps1` 与 `setup_x64dbg_runtime.ps1` 是维护者联网重建运行资产的脚本，不是用户安装前置步骤。`-RuntimeSource` 仅用于显式导入其他已校验运行包。完整包不含 DSH、商业 Reverse 程序、用户项目或缓存；用户工程应单独备份，打包脚本拒绝 `-IncludeProjects`。
-
-上游源码归档位于 `third_party/sources/ghidra-12.1.4`、`ghidra-master`、`x64dbg-development` 与 `x64dbg-runtime`，来源、固定提交/gitlinks、逐文件 SHA-256、符号链接 materialize 记录及已知缺件见 [源码清单](third_party/sources/manifest.json)。随包 Ghidra 来自固定 `Ghidra_12.1.4_build` 源码的本地完整 DEV 构建，包含 Java 分析框架、PyGhidra 与自编译 native 核心；`ghidra_12.1.4_PUBLIC` 目录名仅为兼容别名。桌面原档 `ghidra-master` 是单独保留的 12.3 DEV 研究资料。x64dbg 的 x86/x64 无头核心、bridge、dbg、loaddll 与 TitanEngine 已按固定修订及维护补丁重建；GUI 与列明的链接依赖仍为预编译资产。development 原档缺少提交信息，其补充子模块采用清单中明确记录的固定运行版修订，不冒称原 development gitlinks。构建步骤和证据见 [BUILD](docs/BUILD.md)；用户运行包不承诺包含全部编译器、SDK、Qt 开发环境和传递依赖的离线重编工具链。引擎源码中的功能也不自动成为 IG5 已暴露工具。
-
-分发保留 [第三方许可清单](THIRD_PARTY_NOTICES.txt) 与各组件许可证；第三方代码、运行件和依赖按自身许可分发，不受项目自有代码的 NC 条款覆盖。
-
-## 开发验证与同步 SOP
-
-所有修改在源码目录 `dsh-infinite-gen-5` 完成，运行副本是 `%USERPROFILE%\.dsh\plugins\dsh-infinite-gen-5`。使用与宿主一致的 Python；以下 `$pythonExe` 应设为实际配置路径。顺序为全部 IG5 自有源码语法/编译检查→封存运行资产→回归烟测→镜像→重启→检查本次日志，检查失败停止发布。第三方源码与运行资产按其清单校验，不使用 IG5 的 Node/Python 对整套上游源码混编。以下封存和验收命令面向项目维护，普通安装无需执行；自包含验收会运行生成的临时 PE。
-
-```powershell
-$sourceRoot = [IO.Path]::GetFullPath(if ($env:IG5_SOURCE) { $env:IG5_SOURCE } else { (Join-Path $env:USERPROFILE 'Desktop\无限五代\dsh-infinite-gen-5') })
-$pluginRoot = [IO.Path]::GetFullPath(Join-Path $env:USERPROFILE '.dsh\plugins\dsh-infinite-gen-5')
-$pythonExe = "C:\path\to\configured\python.exe"
-Get-ChildItem -LiteralPath $sourceRoot -Recurse -File | Where-Object { $_.Extension -in '.js','.mjs','.cjs' -and $_.FullName -notmatch '[\\/](third_party|runtimes|vendor|node_modules|\.git)[\\/]' } | ForEach-Object {
-    & node --check $_.FullName
-    if ($LASTEXITCODE -ne 0) { throw "JavaScript 检查失败: $($_.FullName)" }
-}
-Get-ChildItem -LiteralPath $sourceRoot -Recurse -Filter '*.py' -File | Where-Object { $_.FullName -notmatch '[\\/](third_party|runtimes|vendor|node_modules|\.git)[\\/]' } | ForEach-Object {
-    & $pythonExe -m py_compile $_.FullName
-    if ($LASTEXITCODE -ne 0) { throw "Python 编译失败: $($_.FullName)" }
-}
-# 维护者更新/修补运行资产后，重建并验证包内文件 SHA-256 清单
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sourceRoot 'scripts\seal_runtime_bundle.ps1')
-if ($LASTEXITCODE -ne 0) { throw '运行包封存失败，停止发布' }
-& node (Join-Path $sourceRoot 'scripts\test_runtime_bundle.mjs')
-if ($LASTEXITCODE -ne 0) { throw '运行包结构/路由回归失败' }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sourceRoot 'scripts\test_install_package.ps1')
-if ($LASTEXITCODE -ne 0) { throw '安装/打包隔离回归失败' }
-& node (Join-Path $sourceRoot 'scripts\test_self_contained.mjs')
-if ($LASTEXITCODE -ne 0) { throw '自包含真实运行验收失败' }
-& node (Join-Path $sourceRoot 'scripts\test_new_tools.mjs')
-if ($LASTEXITCODE -ne 0) { throw '烟测失败，停止发布' }
-# /MIR 会删除目的目录多余文件；先核实这两个解析后的绝对路径
-$sourceRoot
-$pluginRoot
-if ($sourceRoot -eq $pluginRoot -or $pluginRoot -ne (Join-Path $env:USERPROFILE '.dsh\plugins\dsh-infinite-gen-5')) { throw '镜像目录不符合预期' }
-& robocopy $sourceRoot $pluginRoot /MIR /FFT /Z /NP /XJ /XD .git __pycache__
-if ($LASTEXITCODE -gt 7) { throw "Robocopy 失败: $LASTEXITCODE" }
-Get-Process -Name '*DeepSeek*' -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 2
-Start-Process -FilePath (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe') -WindowStyle Hidden
-Get-Content -LiteralPath (Join-Path $env:USERPROFILE '.dsh\ig5\artifacts\ig5-diag.log') -Tail 30
-```
-
-核对本次启动 `/ig5-diag`、`/ig5-jobs`、`/ig5-data`、审批门和客户端挂载；不要把旧日志视为新版本已加载。默认静态样本是上级 `_research\fixtures\notepad.exe`；动态和补丁测试使用副本或生成 PE。
-
-## 回归命令概览
-
-| 命令 | 覆盖 |
-|---|---|
-| `npm run harness:check`、`npm run test:new-tools` | 基础 JS 检查与真实样本工具烟测；不替代 SOP 全项目检查 |
-| `npm run test:host`、`npm run test:data-route`、`npm run test:workflow`、`npm run test:client` | 宿主、只读路由、Core8/Full38 与七技能生命周期、renderer/引擎竞态/原生焦点 |
-| `npm run test:host-sdk` | 从实际安装的 DSH `app.asar` 加载真实 Cordis / tools / skills / commands / projection 服务，在隔离 context 验证兼容与审批；不启动桌面界面或原生分析引擎 |
-| `npm run test:json-output`、`node scripts/test_approval_gate.mjs` | 严格 JSON 输出、12 工具审批允许/拒绝/取消及下游策略；独立 gate 检查不执行样本 |
-| `npm run test:public-tools` | 生成样本上逐项断言 38 个公开工具的真实执行结果，单独记录后端不支持项；本轮完整结果以生成的 catalog 报告为准，不以注册数量判定通过 |
-| `npm run test:crypto`、`npm run test:protocol`、`npm run test:scan` | 解密 24 项、协议 37 项、扫描 18 项：已知向量、认证失败、真实字节、正零 JSON 与明确预算 |
-| `npm run test:crypto-recovery`、`npm run test:protocol-inference`、`npm run test:discovery-runtime` | 自动恢复与误报/预算；未知 framing/字段/holdout；真实静态字节→候选密钥检索→敏感 key ref 解密→推断解码，不执行样本 |
-| `npm run test:analysis-host`、`npm run test:analysis-runtime` | 数据宿主 20 项、两真实静态引擎 12 项：来源引用、只读读取、AES-GCM→gzip→验证→协议帧、取消恢复；不执行样本 |
-| `npm run test:projects` | 持久身份、崩溃锁恢复/真进程竞争、物理数据库别名/修订、64 位地址及双向歧义拒绝 |
-| `npm run test:worker-budget`、`npm run test:attachment-leases` | UTF-8/缓冲/启动队列预算、真实子进程清理；双进程创建身份、孤儿 worker 保留和 nonce 幂等恢复 |
-| `npm run test:audit-history`、`npm run test:patch-export-scope`、`npm run test:history-maintenance` | 审计游标预算、样本隔离导出；active/archive 异步索引、引用复用、篡改与目录替换拒绝 |
-| `npm run test:runtime-bundle`、`npm run test:self-contained` | 结构/搬移/profile Junction 与 preserve-symlinks/显式覆盖拒绝夹具；清空外部运行配置后的真实包内 Ghidra+x64dbg 验收及运行资产不变性 |
-| `npm run test:reverse-runtime` | Reverse 发现、明确配置优先、文件/PE/Python 检查、诊断脱敏与启动待验证状态；结构夹具不启动商业内核 |
-| `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test_install_package.ps1` | 临时 profile/运行件夹具中的安装、备份/失败回退、缺件与打包过滤；不替代真实引擎验收 |
-| `npm run test:engines`、`npm run test:ghidra` | 真实 Ghidra、双引擎 changeset/字节导出/Undo 与修订校验 |
-| `npm run test:ghidra-project-paths` | 默认 `.dsh` 本地目录、13 项原生路径边界、工程关闭重开与反编译持久化；不执行样本 |
-| `npm run test:debug-api`、`npm run test:debug-runtime`、`npm run test:x64dbg` | Mock API；真实 Reverse win32；独立 x64dbg headless（会执行受控测试程序） |
-| `npm run test:advanced`、`npm run test:semantic-diff`、`npm run test:patch-runtime` | 高阶分析/受限仿真、差异匹配、补丁前置校验与导出 Undo |
-| `node --test scripts/test_crypto_analysis.mjs`、`node --test scripts/test_protocol_analysis.mjs` | 固定 AES 向量、认证/padding/预算、配置提取与捕获/分帧/字段/缺口冲突证据；数据层不执行样本 |
-
-Ghidra 默认 `analysis_profile=interactive`，仅跳过批量 Decompiler Parameter ID 分析器，函数反编译仍可用；需要该批量分析时显式设 `full`。`analysis_timeout` 为 1–600 秒，预算到期保留 partial 和分析状态，工作台显示“部分分析结果”，不能当成完整分析完成。真实 notepad 的 interactive 分析约 85 秒、853 函数、无超时，分析后 decompile 子进程数为 0；这不是任意样本的性能保证。真实 Ghidra-only 与跨引擎公开工具测试通过；x64dbg x64/x86 真实 headless 闭环、24 项 fake 回归、命名管道 DACL、取消/超时/强杀清理均通过。Reverse native win32 的 notepad 副本动态闭环通过，Bochs 仅 load/bpt；不能外推任意样本或所有文件格式。前端浏览器使用真实 DSH React 与明确标注的 mock fixture，不能当成动态后端证据。
-
-Ghidra 的 `partial/analysisComplete` 描述全程序在所选 profile 下的完成状态；`scopePartial/scopeComplete` 描述本次范围分析。范围成功不会把尚未完成的全程序标为完整，也不会改变既有全程序 profile。
-
-Ghidra 写响应中的 `committed=true` 表示原生内存事务完成，`saved=true` 才表示数据库保存已确认。名称、行尾注释和补丁每次保存；类型、结构体与分析写入保留原生会话 Undo，返回 `persistence=session-only`，正常 `ig5_close` 保存。后续保存会使相应原生 Undo 失效。强杀、硬超时或异常退出可能丢失 session-only 修改，重开时应检查 `recovery`、`durableRevision`、`unsavedChanges`。`partial_commit` 与 `recoveryRequired=true` 表示提交/保存/审计持久化链未全部确认，并不表示回滚；先检查数据库与恢复结果，不自动重放写入或盲目重试。原生保存与 sidecar/审计文件不是一个原子事务。
-
-Reverse 微码原生 filter 管线与构造临时 MBA 的 xor-self/sub-self 改写已验，自然函数规则命中仍为 0，未实现通用去平坦化。RTTI 的 MSVC64/Itanium class/SI/VMI 已验证生成 PE 字节布局，非原生 Linux ELF 装载验证；显式 table+offset 不自动推导寄存器来源。bindiff 是保留歧义/截断的启发式匹配和变更块，包含 memoff +4→+8 测试，不是 BSim、语义等价或自动漏洞证明。Unicorn 2.1.4 支持 provider 实际提供的 x86/x64 或 Ghidra ARM64/AAPCS64，复制最多 64 MiB，无 OS/import/TLS。已知引擎 R/W/X 按 4096-byte 页保护，同页区间取权限并集；未知权限页兼容 RWX 并明确标记，合成栈/新增缓冲为 RW，注入不提升已有引擎页权限。返回区分保护/未映射 fault、超时与指令上限，不能当完整 OS 保护模拟；ARM64 的 Windows 宿主验收不代表手机原生移植。依赖锁定见 [requirements](worker/requirements-emulation.txt)，保留 [NOTICE](worker/vendor/NOTICE.txt)。
-
----
 
 ## 🧭 逆向工作台操作与常用指令
 
