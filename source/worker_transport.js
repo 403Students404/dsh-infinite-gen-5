@@ -13,7 +13,7 @@ function receiveLimits(value = {}) {
 
 /** Engine-specific paths/environment; the JSONL transport below is engine neutral. */
 export function workerLaunch(cfg, engine, pluginRoot) {
-  const paths = cfg.host?.platform === 'linux' ? path.posix : path;
+  const paths = ['linux', 'darwin'].includes(cfg.host?.platform) ? path.posix : path;
   const env = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
   const builtinReverse = engine === 'reverse' && cfg.reverseProvider === 'bundled';
   const provider = builtinReverse ? 'ghidra' : engine;
@@ -40,7 +40,7 @@ export function workerLaunch(cfg, engine, pluginRoot) {
   return { executable, args, options: {
     stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env,
     // A new POSIX process group lets timeout cleanup include native decompiler children.
-    ...(cfg.host?.platform === 'linux' ? { detached: true } : {}),
+    ...(['linux', 'darwin'].includes(cfg.host?.platform) ? { detached: true } : {}),
   } };
 }
 

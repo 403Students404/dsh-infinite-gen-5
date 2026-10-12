@@ -51,10 +51,27 @@ function elfArchitecture(file) {
   } finally { fs.closeSync(descriptor); }
 }
 
+function machArchitecture(file) {
+  const descriptor = fs.openSync(file, 'r');
+  try {
+    const header = Buffer.alloc(32);
+    // Deliberately reject FAT/universal binaries: the pack must contain a native
+    // arm64 slice, without depending on Rosetta or selecting a different slice.
+    if (fs.readSync(descriptor, header, 0, header.length, 0) !== header.length
+        || header.readUInt32LE(0) !== 0xfeedfacf || header.readUInt32LE(4) !== 0x0100000c
+        || ![2, 6, 8].includes(header.readUInt32LE(12))) {
+      throw new Error('expected thin macOS Mach-O 64-bit arm64 executable/dylib/bundle');
+    }
+  } finally { fs.closeSync(descriptor); }
+}
+
 /** Validate structure and small native headers. Full SHA-256 verification belongs to packaging/install. */
 export function readRuntime(root, engine, override, options = {}) {
   const host = options.host || hostPlatform();
   const windows = host.id === 'win32-x64';
+  const mac = host.id === 'darwin-arm64';
+  const validation = windows ? 'structure-and-pe-headers' : mac ? 'structure-and-mach-o-headers' : 'structure-and-elf-headers';
+  const nativeArchitecture = windows ? peArchitecture : mac ? machArchitecture : elfArchitecture;
   const pathKey = value => windows ? value.replaceAll('\\', '/').toLowerCase() : value.replaceAll('\\', '/');
   const source = options.source || (override ? 'override' : 'config');
   const location = path.resolve(override || path.join(root, engine, 'runtime.json'));
@@ -63,10 +80,10 @@ export function readRuntime(root, engine, override, options = {}) {
   const base = path.dirname(file), errors = [];
   let raw = {}, inventory, physicalBase;
   const failure = () => ({ ...raw, engine, source, platform: raw.platform || host.id, manifest: file, root: base, available: false,
-    validation: windows ? 'structure-and-pe-headers' : 'structure-and-elf-headers', integrityVerified: false, validationErrors: errors,
+    validation, integrityVerified: false, validationErrors: errors,
     reason: errors.slice(0, 8).join('; ') });
   if (!host.supported || engine === 'x64dbg' && !windows) {
-    errors.push(!host.supported ? host.reason : 'x64dbg requires a Windows x64 host; no Android/Linux/iOS native runtime is supported');
+    errors.push(!host.supported ? host.reason : 'x64dbg requires a Windows x64 host; no macOS/Linux/Android/iOS native runtime is supported');
     return failure();
   }
   try {
@@ -123,7 +140,7 @@ export function readRuntime(root, engine, override, options = {}) {
         if (expected === undefined || expected !== stat.size) throw new Error('file is missing from inventory or has a different byte size');
       }
       if (kind === 'executable') fs.accessSync(value, fs.constants.X_OK);
-      if (bits) windows ? peArchitecture(value, bits) : elfArchitecture(value);
+      if (bits) nativeArchitecture(value, bits);
       return value;
     } catch (error) { errors.push(label + ': ' + error.message); return null; }
   };
@@ -147,12 +164,17 @@ export function readRuntime(root, engine, override, options = {}) {
       } catch (error) { errors.push('Python isolated search path: ' + error.message); }
     }
   } else {
-    if (raw.pythonVersion !== '3.12') errors.push('Linux pack must declare the supported Python ABI pythonVersion=3.12');
+    if (raw.pythonVersion !== '3.12') errors.push(`${mac ? 'macOS' : 'Linux'} pack must declare the supported Python ABI pythonVersion=3.12`);
+    if (mac && !/^libpython3\.12\.dylib$/.test(path.basename(resolved.pythonLibrary || ''))) errors.push('macOS Python shared library must be libpython3.12.dylib');
     component(resolved.pythonLibrary, 'Python shared library', 'file', 64);
     const stdlib = component(resolved.pythonStdlib, 'Python standard library', 'directory');
     for (const name of ['os.py', 'site.py', 'encodings/__init__.py']) under(stdlib, name, 'Python standard library ' + name);
     component(resolved.pythonModules, 'Python site packages', 'directory');
-    if (!/^_jpype\.cpython-312-aarch64-linux-gnu\.so$/.test(path.basename(resolved.jpypeLibrary || ''))) errors.push('Linux JPype library must match the Python 3.12 AArch64 ABI');
+    const jpypeName = mac ? '_jpype.cpython-312-darwin.so' : '_jpype.cpython-312-aarch64-linux-gnu.so';
+    if (path.basename(resolved.jpypeLibrary || '') !== jpypeName
+        || !resolved.pythonModules || path.dirname(resolved.jpypeLibrary || '') !== resolved.pythonModules) {
+      errors.push(`${mac ? 'macOS' : 'Linux'} JPype library must be ${jpypeName} in Python 3.12 site-packages`);
+    }
     component(resolved.jpypeLibrary, 'JPype native extension', 'file', 64);
   }
   if (engine === 'ghidra') {
@@ -166,14 +188,16 @@ export function readRuntime(root, engine, override, options = {}) {
         const minimum = Number(app.match(/^application\.java\.min=(\d+)/m)?.[1]);
         const major = Number(jdk.match(/^JAVA_VERSION="(\d+)/m)?.[1]);
         const actualVersion = app.match(/^application\.version=(.+)$/m)?.[1].trim();
-        if (!minimum || !major || major < minimum || !(windows ? /^OS_ARCH="(?:x86_64|amd64)"/m : /^OS_ARCH="(?:aarch64|arm64)"/m).test(jdk)) throw new Error('JDK architecture/version is incompatible with Ghidra');
+        if (!minimum || !major || major < minimum
+            || !(windows ? /^OS_ARCH="(?:x86_64|amd64)"/m : /^OS_ARCH="(?:aarch64|arm64)"/m).test(jdk)
+            || mac && !/^OS_NAME="(?:Darwin|Mac OS X)"/m.test(jdk)) throw new Error('JDK architecture/version is incompatible with Ghidra');
         if (raw.version && raw.version !== actualVersion) throw new Error('Ghidra application version does not match its manifest');
       } catch (error) { errors.push('Ghidra/JDK metadata: ' + error.message); }
     }
     under(java, windows ? 'bin/java.exe' : 'bin/java', 'JDK java', windows ? 'file' : 'executable', 64);
-    under(java, windows ? 'bin/server/jvm.dll' : 'lib/server/libjvm.so', 'JDK JVM', 'file', 64);
+    under(java, windows ? 'bin/server/jvm.dll' : mac ? 'lib/server/libjvm.dylib' : 'lib/server/libjvm.so', 'JDK JVM', 'file', 64);
     if (windows) for (const name of ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll']) under(java, 'bin/' + name, 'JDK C++ runtime ' + name, 'file', 64);
-    if (!windows) { under(java, 'lib/jli/libjli.so', 'JDK launcher library', 'file', 64); under(java, 'lib/modules', 'JDK runtime modules'); }
+    if (!windows) { under(java, mac ? 'lib/libjli.dylib' : 'lib/jli/libjli.so', 'JDK launcher library', 'file', 64); under(java, 'lib/modules', 'JDK runtime modules'); }
     under(java, 'jmods/java.base.jmod', 'JDK base module');
     under(java, 'legal', 'JDK licenses', 'directory');
     for (const [suffix, label] of [
@@ -184,7 +208,9 @@ export function readRuntime(root, engine, override, options = {}) {
       ['LICENSE', 'Ghidra license'], ['bom.json', 'Ghidra component inventory'],
     ]) under(ghidra, suffix, label);
     under(ghidra, 'licenses', 'Ghidra third-party licenses', 'directory');
-    under(ghidra, windows ? 'Ghidra/Features/Decompiler/os/win_x86_64/decompile.exe' : 'Ghidra/Features/Decompiler/os/linux_arm_64/decompile', 'Ghidra native decompiler', windows ? 'file' : 'executable', 64);
+    under(ghidra, windows ? 'Ghidra/Features/Decompiler/os/win_x86_64/decompile.exe'
+      : `Ghidra/Features/Decompiler/os/${mac ? 'mac_arm_64' : 'linux_arm_64'}/decompile`, 'Ghidra native decompiler', windows ? 'file' : 'executable', 64);
+    if (mac) under(ghidra, 'Ghidra/Features/Decompiler/os/mac_arm_64/sleigh', 'Ghidra native sleigh', 'executable', 64);
     for (const name of ['pyghidra/__init__.py', 'pyghidra/launcher.py', 'jpype/__init__.py', 'packaging/__init__.py', 'org.jpype.jar']) under(windows ? pythonHome && path.join(pythonHome, 'pylib') : resolved.pythonModules, name, 'Python dependency ' + name);
     if (windows) under(pythonHome, 'pylib/_jpype.cp312-win_amd64.pyd', 'JPype native extension', 'file', 64);
     if (source === 'bundled' && windows) {
@@ -215,7 +241,7 @@ export function readRuntime(root, engine, override, options = {}) {
   }
   under(pythonHome, 'LICENSE.txt', 'Python license');
   return { ...resolved, available: errors.length === 0, portable: errors.length === 0,
-    validation: windows ? 'structure-and-pe-headers' : 'structure-and-elf-headers', integrityVerified: false, validationErrors: errors,
+    validation, integrityVerified: false, validationErrors: errors,
     ...(errors.length ? { reason: errors.slice(0, 8).join('; ') } : {}) };
 }
 

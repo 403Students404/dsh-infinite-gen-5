@@ -10,7 +10,7 @@ export function hostPlatform(options = {}) {
   const androidRootfs = platform === 'linux' && arch === 'arm64'
     && !!(environment.ANDROID_ROOT || environment.ANDROID_DATA || environment.IG5_ANDROID_ROOTFS === '1');
   const id = `${platform}-${arch}`;
-  const supported = id === 'win32-x64' || id === 'linux-arm64';
+  const supported = id === 'win32-x64' || id === 'linux-arm64' || id === 'darwin-arm64';
   return {
     platform, arch, id, supported,
     execution: platform === 'ios' ? 'unsupported-native-host' : androidRootfs ? 'android-linux-rootfs' : 'local-node-host',
