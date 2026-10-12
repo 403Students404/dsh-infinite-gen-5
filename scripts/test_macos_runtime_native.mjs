@@ -18,9 +18,15 @@ async function main([root, sample, filter]) {
   assert.ok(fs.statSync(target).isFile(), 'sample must be a file');
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'ig5-mac-native-smoke-'));
   const owner = fs.statSync(temporary);
+  // Optional real check of the macOS default under an isolated HOME; never writes to the user's Library.
+  const checkDefaultProjectRoot = process.env.IG5_MAC_NATIVE_DEFAULT_PROJECT_ROOT === '1';
+  const originalHome = process.env.HOME;
+  if (checkDefaultProjectRoot) process.env.HOME = temporary;
   let child, client;
   try {
-    const cfg = runtimeConfiguration({ runtimeRoot: root, projectRoot: temporary });
+    const cfg = runtimeConfiguration({ runtimeRoot: root, ...(checkDefaultProjectRoot ? {} : { projectRoot: temporary }) });
+    if (checkDefaultProjectRoot) assert.equal(cfg.projectRoot,
+      path.join(temporary, 'Library', 'Application Support', 'DeepSeek Harness', 'IG5', 'projects'));
     assert.equal(cfg.host.id, 'darwin-arm64');
     assert.equal(cfg.ghidra.available, true, cfg.ghidra.reason);
     assert.equal(cfg.ghidra.integrityVerified, false, 'startup validation does not rehash the entire runtime');
@@ -62,6 +68,7 @@ async function main([root, sample, filter]) {
       console.log(JSON.stringify({ nativeVerified: true, route, engine: doctor.engine, version: doctor.version,
         host: cfg.host.id, sample: target, function: selected.name, ea: selected.ea,
         codePreview: decompiled.code.trim().slice(0, 300), validation: cfg.ghidra.validation,
+        projectRoot: cfg.projectRoot, defaultProjectRootUsed: checkDefaultProjectRoot,
         integrityVerified: cfg.ghidra.integrityVerified }));
       client.dispose();
       client = null;
@@ -70,6 +77,10 @@ async function main([root, sample, filter]) {
   } finally {
     if (child && child.exitCode === null && !child.signalCode) terminateTree(child);
     client?.dispose();
+    if (checkDefaultProjectRoot) {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
     // Delete only this invocation's just-created, same-inode scratch project.
     try {
       const now = fs.lstatSync(temporary);

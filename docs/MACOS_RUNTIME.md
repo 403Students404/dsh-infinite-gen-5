@@ -29,12 +29,14 @@ node scripts/prepare_macos_runtime.mjs \
 
 输入目录不得互相重叠或指向输出，输出必须不存在，父目录须已存在且无符号链接别名。脚本检查树内 symlink 不逃逸、必需的 Mac Mach-O arm64/CPython ABI/JDK metadata、Ghidra 文件与许可；在输出父目录的临时 staging 完成 `readRuntime` 结构核验、逐文件 SHA-256/size 与符号链接清单、**包内** Python 隔离 import 与 JDK21/JPype JVM 启动测试后才发布新包。`manifest.json` 记录全量 SHA-256/size；实际启动路径只做有界结构及原生文件头检查，**不会重新哈希全部文件**，所以 `integrityVerified=false` 是预期值。首次发布后按可信来源保护目录权限，若资产变动须重新核对清单。
 
-独立源码副本可用 `IG5_RUNTIME_ROOT="$PWD/runtimes/darwin-arm64"` 指定外部运行包根；或在部署新插件时按版本将整个 `darwin-arm64/` 目录交付于**该已加载插件自身**的 `runtimes/` 下。也可仅指定 `IG5_GHIDRA_RUNTIME=/absolute/path/ghidra/runtime.json`。环境变量须由真正运行 DSH 的宿主进程继承；从 Finder 启动的 GUI 不会继承一个无关 shell 的临时变量。显式覆盖失败绝不回退到其他版本目录。不要直接改动当前 DSH 已安装运行副本；正常升级并完全退出/重启 DSH 后，再在**实际已安装新插件的进程中**执行 `/ig5 engines`、`ig5_doctor engine=ghidra`、`ig5_open engine=ghidra`、`ig5_funcs` 和 `ig5_decompile`，最后 `ig5_close`。切换源码目录本身不足以更新已经加载的插件。
+独立源码副本可用 `IG5_RUNTIME_ROOT="$PWD/runtimes/darwin-arm64"` 指定外部运行包根；或在部署新插件时按版本将整个 `darwin-arm64/` 目录交付于**该已加载插件自身**的 `runtimes/` 下。也可仅指定 `IG5_GHIDRA_RUNTIME=/absolute/path/ghidra/runtime.json`。环境变量须由真正运行 DSH 的宿主进程继承；从 Finder 启动的 GUI 不会继承一个无关 shell 的临时变量。显式覆盖失败绝不回退到其他版本目录。不要直接改动当前 DSH 已安装运行副本；正常升级并完全退出/重启 DSH 后，再在**实际已安装新插件的进程中**执行 `/ig5 engines`、`ig5_doctor engine=ghidra`、`ig5_open engine=ghidra`、`ig5_funcs` 和 `ig5_decompile`，最后 `ig5_close`。切换源码目录本身不足以更新已经加载的插件。macOS 官方/通用 Ghidra 12.1.4 的 `open_project` 会拒绝项目路径中以 `.` 开头的目录段（典型报错：`java.lang.IllegalArgumentException: Path element starting with '.' is not permitted`），因此 Mac 默认分析数据库放在 `~/Library/Application Support/DeepSeek Harness/IG5/projects`，不放在 `~/.dsh/ig5/projects`。显式 `projectRoot` 覆盖须同样避开隐藏目录；例如持久配置可设为 `/Users/<user>/IG5Projects`，建议目录权限 `0700`。其它平台默认数据库位置未变。
 
 可在源码目录先跑 `node scripts/test_host_platform.mjs`、`node scripts/test_worker_transport.mjs`、`npm run test:macos-pack`；合成 fixture 验证选包、Mach-O/路径拒绝等，但**不是原生引擎启动验收**。脚本的包内依赖 probe 成功同样不等于 doctor/open/decompile 成功。使用已授权本地样本做真正的隔离验收（只静态导入、不执行样本）：
 
 ```sh
 node scripts/test_macos_runtime_native.mjs "$PWD/runtimes/darwin-arm64" '/absolute/path/to/local-sample' 'function-name-filter'
+# 同时验证 Mac 默认的非隐藏 Ghidra 项目根（HOME 临时隔离、结束后清理）：
+IG5_MAC_NATIVE_DEFAULT_PROJECT_ROOT=1 node scripts/test_macos_runtime_native.mjs "$PWD/runtimes/darwin-arm64" '/absolute/path/to/local-sample' 'function-name-filter'
 ```
 
 此命令走仓库实际 `runtimeConfiguration → workerLaunch`，分别对 Ghidra 与默认内置 Reverse 路由要求 doctor/open/funcs/decompile/close 成功，并把临时 Ghidra 项目留在隔离空间直到结束后删除。2026 年 10 月的维护机验证：Apple Silicon/macOS，Ghidra 12.1.4、Python 3.12.12、JPype 1.5.2、JDK 21.0.11，离线包共校验 8,000 文件及 214 相对 symlinks；本地 ARM64 Mach-O `weighted_sum` 的完整静态调用链 doctor→open（2 函数、非 partial）→funcs→decompile（`local_c * 7`）→close 通过。该单一样本结果不代表所有格式、部署方式或 DSH GUI 安装态已验证。macOS `ig5_doctor` 显示的 x64dbg/商业 Reverse 不可用属预期。密钥/报文等纯数据工具仍可不依赖任何静态引擎工作。

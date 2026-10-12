@@ -111,6 +111,14 @@ try {
   assert.equal(darwin.execution, 'local-node-host');
   const missingMacPack = moved.runtimeConfiguration({}, { host: darwin });
   assert.equal(missingMacPack.runtimeRoot, path.join(relocated, 'runtimes/darwin-arm64'));
+  const macProjectRoot = path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeek Harness', 'IG5', 'projects');
+  assert.equal(missingMacPack.projectRoot, macProjectRoot);
+  assert.equal(moved.runtimeConfiguration({ home: path.join(scratch, '.hidden-home') }, { host: darwin }).projectRoot,
+    macProjectRoot, 'custom hidden state homes must not force Ghidra projects under a leading-dot directory');
+  assert.equal(moved.runtimeConfiguration({ projectRoot: path.join(scratch, 'explicit-projects') }, { host: darwin }).projectRoot,
+    path.join(scratch, 'explicit-projects'), 'an explicit project root must remain authoritative');
+  assert.equal(moved.runtimeConfiguration({}, { host: linux }).projectRoot,
+    path.join(os.homedir(), '.dsh', 'ig5', 'projects'), 'legacy Linux layout is unchanged');
   assert.equal(missingMacPack.ghidra.available, false);
   assert.match(missingMacPack.ghidra.reason, /Missing matching darwin-arm64 runtime pack/);
   assert.equal(missingMacPack.x64dbg.available, false);

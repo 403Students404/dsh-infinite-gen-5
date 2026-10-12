@@ -258,7 +258,12 @@ export function runtimeConfiguration(cfg = {}, options = {}) {
     const source = cfg[engine + 'Runtime'] ? 'config' : value ? 'environment' : rootSource;
     return readRuntime(runtimeRoot, engine, value, { source, bundleRoot: runtimeRoot, host });
   };
-  return { host, home, runtimeRoot, reverseProvider, projectRoot: path.resolve(cfg.projectRoot || path.join(home, 'projects')),
+  // Stock macOS Ghidra rejects project paths containing a leading-dot segment (e.g. ~/.dsh).
+  // Keep the default database location outside the hidden IG5 config directory.
+  const defaultProjectRoot = host.id === 'darwin-arm64'
+    ? path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeek Harness', 'IG5', 'projects')
+    : path.join(home, 'projects');
+  return { host, home, runtimeRoot, reverseProvider, projectRoot: path.resolve(cfg.projectRoot || defaultProjectRoot),
     ghidra: select('ghidra'), x64dbg: select('x64dbg') };
 }
 
