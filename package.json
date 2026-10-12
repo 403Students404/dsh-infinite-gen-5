@@ -60,6 +60,8 @@
     "test:scan": "python -B scripts/test_scan_analysis.py",
     "test:cpu": "python -B scripts/test_cpu_emulator.py",
     "test:platform": "node scripts/test_host_platform.mjs",
+    "test:macos-pack": "node scripts/test_macos_runtime_pack.mjs && node scripts/test_prepare_macos_runtime.mjs",
+    "test:macos-native": "node scripts/test_macos_runtime_native.mjs",
     "test:transport": "node scripts/test_worker_transport.mjs",
     "test:worker-budget": "node scripts/test_worker_budget.mjs",
     "test:attachment-leases": "node scripts/test_attachment_leases.mjs",

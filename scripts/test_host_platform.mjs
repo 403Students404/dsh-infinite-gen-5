@@ -9,7 +9,7 @@ import { hostPlatform } from '../source/host_platform.js';
 import { runtimeConfiguration } from '../engine_runtime.js';
 
 const source = fileURLToPath(new URL('..', import.meta.url));
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ig5-platform-'));
+const scratch = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'ig5-platform-'));
 const relocated = path.join(scratch, '中文 离线插件');
 const root = path.join(relocated, 'runtimes', 'linux-arm64');
 const pack = path.join(root, 'ghidra');
@@ -89,19 +89,41 @@ try {
   assert.match(missing.ghidra.reason, /Missing matching linux-arm64 runtime pack/);
   assert.equal(missing.runtimeRoot, root);
   fs.renameSync(root + '.saved', root);
-  const windowsOnLinux = runtimeConfiguration({ ghidraRuntime: path.join(source, 'runtimes/ghidra') }, { host: android });
+  const windowsPack = path.join(scratch, 'win32-x64/ghidra');
+  write(path.join(windowsPack, 'runtime.json'), JSON.stringify({ schemaVersion: 1,
+    engine: 'ghidra', platform: 'win32-x64' }));
+  const windowsOnLinux = runtimeConfiguration({ ghidraRuntime: windowsPack }, { host: android });
   assert.equal(windowsOnLinux.ghidra.available, false);
   assert.match(windowsOnLinux.ghidra.reason, /win32-x64.*linux-arm64/);
   pass('missing ARM64 pack is explicit; existing Windows binaries cannot be used as fallback');
 
-  for (const [platform, arch] of [['ios', 'arm64'], ['android', 'arm64'], ['linux', 'x64'], ['darwin', 'arm64']]) {
+  for (const [platform, arch] of [['ios', 'arm64'], ['android', 'arm64'], ['linux', 'x64'], ['darwin', 'x64']]) {
     const host = hostPlatform({ platform, arch, env: {} });
     const value = moved.runtimeConfiguration({}, { host });
     assert.equal(host.supported, false); assert.equal(value.ghidra.available, false);
     assert.equal(value.x64dbg.available, false);
     assert.match(value.ghidra.reason, platform === 'ios' ? /No validated iOS/ : platform === 'android' ? /Bionic/ : /No matching/);
   }
-  pass('iOS unknown-native-host and Android Bionic remain explicitly unsupported');
+  pass('iOS unknown-native-host, Android Bionic and unsupported ISA remain explicitly unavailable');
+
+  const darwin = hostPlatform({ platform: 'darwin', arch: 'arm64', env: {} });
+  assert.equal(darwin.id, 'darwin-arm64'); assert.equal(darwin.supported, true);
+  assert.equal(darwin.execution, 'local-node-host');
+  const missingMacPack = moved.runtimeConfiguration({}, { host: darwin });
+  assert.equal(missingMacPack.runtimeRoot, path.join(relocated, 'runtimes/darwin-arm64'));
+  const macProjectRoot = path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeek Harness', 'IG5', 'projects');
+  assert.equal(missingMacPack.projectRoot, macProjectRoot);
+  assert.equal(moved.runtimeConfiguration({ home: path.join(scratch, '.hidden-home') }, { host: darwin }).projectRoot,
+    macProjectRoot, 'custom hidden state homes must not force Ghidra projects under a leading-dot directory');
+  assert.equal(moved.runtimeConfiguration({ projectRoot: path.join(scratch, 'explicit-projects') }, { host: darwin }).projectRoot,
+    path.join(scratch, 'explicit-projects'), 'an explicit project root must remain authoritative');
+  assert.equal(moved.runtimeConfiguration({}, { host: linux }).projectRoot,
+    path.join(os.homedir(), '.dsh', 'ig5', 'projects'), 'legacy Linux layout is unchanged');
+  assert.equal(missingMacPack.ghidra.available, false);
+  assert.match(missingMacPack.ghidra.reason, /Missing matching darwin-arm64 runtime pack/);
+  assert.equal(missingMacPack.x64dbg.available, false);
+  assert.match(missingMacPack.x64dbg.reason, /requires a Windows/);
+  pass('macOS ARM64 is a supported host, but absent native packs never fall back to Linux/Windows');
 
   for (const glibcVersion of [null, '2.16']) {
     const value = moved.runtimeConfiguration({}, { host: hostPlatform({ platform: 'linux', arch: 'arm64', env: {}, glibcVersion }) });

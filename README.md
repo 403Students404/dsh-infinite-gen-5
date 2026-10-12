@@ -157,6 +157,10 @@ Core8 保持不变。`ig5_decompile style=dossier` 在同一静态会话与数�
 
 SHA-256 不符时保留报错中的相对路径、Expected/Actual SHA-256 和文件大小，并核对原始 ZIP 哈希；当前证据不能确定其他用户文件变化的原因，不能直接归咎某种解压工具。不要改清单、跳过校验或只补空 JSON。安装成功后 profile 的 `node_modules/dsh-infinite-gen-5` 应指向 `.dsh/plugins/dsh-infinite-gen-5` 的完整目录；未完成安装而保留的普通 npm 源码副本没有运行时。完全退出并重启 DSH 后，以 `/ig5 engines` 和 `ig5_doctor engine=ghidra` 验证新副本。维护者资产重建步骤见 [BUILD](docs/BUILD.md)。
 
+### macOS Apple Silicon（Ghidra 静态分析，实验性）
+
+上面的 `install.ps1` 和 Windows 完整包**不适用于 macOS**；源码副本也没有自带 Apple Silicon 的 JDK、Python 或 Ghidra，不能只修改配置就宣称引擎可用。现可为 `darwin-arm64` 选择独立 Ghidra 运行包（内置 Reverse 静态车道复用 Ghidra 后端），但 x64dbg/原生 Windows 调试不支持；`ig5_emulate` 也不包含可用的 macOS Unicorn 原生运行时。准备包、来源校验及诊断边界见 [macOS 运行包指南](docs/MACOS_RUNTIME.md)。纯数据分析仍可不依赖 Ghidra 使用。
+
 ---
 
 

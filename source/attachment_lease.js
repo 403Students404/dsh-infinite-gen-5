@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
 const pid = value => Number.isSafeInteger(value) && value > 0;
@@ -21,6 +21,15 @@ export function processCreationIdentity(processId) {
       const stat = fs.readFileSync(`/proc/${processId}/stat`, 'utf8');
       const value = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
       return /^\d+$/.test(value || '') ? value : null;
+    }
+    if (process.platform === 'darwin') {
+      // `ps` exposes kernel process birth time without requiring privileged APIs.
+      // Keep the full English timestamp (rather than Date.parse, which depends on
+      // the local timezone/DST); PID reuse within the same second stays retained.
+      const started = execFileSync('/bin/ps', ['-p', String(processId), '-o', 'lstart='],
+        { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' }, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim().replace(/\s+/g, ' ');
+      if (!/^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) [A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d \d{4}$/.test(started)) return null;
+      return BigInt('0x' + createHash('sha256').update(started).digest('hex')).toString(10);
     }
   } catch {}
   return null;
