@@ -144,7 +144,7 @@ try {
     Check (-not (Test-Path -LiteralPath (Join-Path $installed '__pycache__'))) 'installer leaked source bytecode cache'
     Check (-not (Test-Path -LiteralPath (Join-Path $installed '.downloads'))) 'installer leaked development downloads'
     foreach ($name in @('lib\unicorn.dll','__init__.py')) {
-        Check ((Get-FileHash -LiteralPath (Join-Path $fixture "worker\vendor\unicorn\$name")).Hash -eq (Get-FileHash -LiteralPath (Join-Path $installed "worker\vendor\unicorn\$name")).Hash) "installer changed vendor file $name"
+        Check ((Get-IG5Hash (Join-Path $fixture "worker\vendor\unicorn\$name")) -eq (Get-IG5Hash (Join-Path $installed "worker\vendor\unicorn\$name"))) "installer changed vendor file $name"
     }
     Check (-not (Test-Path -LiteralPath (Join-Path $installed 'runtimes\x64dbg\downloads'))) 'installer leaked runtime download cache'
     $profilePath = Join-Path $dsh 'profiles\default\package.json'
@@ -213,7 +213,7 @@ try {
     Check (Test-Path -LiteralPath (Join-Path $portable 'plugin\third_party\sources\upstream\code.cpp')) 'upstream source assets were dropped'
     Check (-not (Test-Path -LiteralPath (Join-Path $portable 'plugin\.downloads'))) 'portable leaked development downloads'
     foreach ($name in @('lib\unicorn.dll','__init__.py')) {
-        Check ((Get-FileHash -LiteralPath (Join-Path $fixture "worker\vendor\unicorn\$name")).Hash -eq (Get-FileHash -LiteralPath (Join-Path $portable "plugin\worker\vendor\unicorn\$name")).Hash) "portable changed vendor file $name"
+        Check ((Get-IG5Hash (Join-Path $fixture "worker\vendor\unicorn\$name")) -eq (Get-IG5Hash (Join-Path $portable "plugin\worker\vendor\unicorn\$name"))) "portable changed vendor file $name"
     }
     foreach ($name in @('projects','sessions','downloads','toolchain','__pycache__','node_modules')) { Check (Test-Path -LiteralPath (Join-Path $portable "plugin\third_party\sources\upstream\$name\source.txt")) "upstream same-name source directory dropped: $name" }
     $instructions = Get-Content -LiteralPath (Join-Path $portable 'INSTALL.txt') -Raw

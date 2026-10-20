@@ -297,11 +297,15 @@ export class ProjectStore {
   }
 
   /** Startup recovery never infers a worker owner from a legacy sessionId string. */
-  recoverAttachments({ limit = 64 } = {}) {
+  recoverAttachments({ limit = 64, retainDebugArtifacts = [] } = {}) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) fail('INVALID_ARGUMENT', 'Attachment recovery limit must be 1..256');
+    if (!Array.isArray(retainDebugArtifacts) || retainDebugArtifacts.some(id => typeof id !== 'string')) fail('INVALID_ARGUMENT', 'Retained debugger artifacts must be explicit identities');
     const active = Object.values(this._read().attachments).filter(item => item.state === 'active');
     const result = { recovered: [], retained: [], examined: Math.min(limit, active.length), truncated: active.length > limit };
     for (const attachment of active.slice(0, limit)) {
+      if (attachment.engine === 'x64dbg' && retainDebugArtifacts.includes(attachment.artifactId)) {
+        result.retained.push({ attachmentId: attachment.attachmentId, reason: 'guest-cleanup-required' }); continue;
+      }
       const check = probeAttachmentLease(attachment.lease);
       if (!check.releasable) { result.retained.push({ attachmentId: attachment.attachmentId, reason: check.reason }); continue; }
       try {

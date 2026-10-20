@@ -10,9 +10,12 @@ import { readAuditPage } from '../source/audit_history.js';
 import vm from 'node:vm';
 import { defineAdvancedTools } from '../advanced_tools.js';
 import { defineIntegrationTools } from '../integration_tools.js';
+import { defineCaptureTools } from '../capture_tools.js';
 import { defineAnalysisTools } from '../analysis_tools.js';
 import { collectFunctionDossier } from '../source/function_dossier.js';
 import { workspaceSchema, runWorkspace, captureDossier } from '../source/investigation_workflow.js';
+import { recoveryProfileSchema, runRecoveryProfile } from '../source/vm_recovery_profile.js';
+import { autonomyStatus } from '../source/autonomy_status.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { engineId } from '../engine_runtime.js';
 import { spawnWorker, attachWorker, doctorWorker } from '../source/worker_transport.js';
@@ -135,6 +138,10 @@ await route.request('?type=struct');
 assert.equal(route.calls.at(-1).params.action, 'list');
 await route.request('?type=microcode&action=optimize&rules=xor-self&maturity=generated');
 assert.equal(route.calls.at(-1).params.action, 'inspect', 'HTTP view cannot install optimization filters');
+assert.equal('rules' in route.calls.at(-1).params, false);
+await route.request('?type=microcode&action=deobfuscate&max_steps=2000&max_evidence=12&rules=xor-self');
+assert.equal(route.calls.at(-1).params.action, 'deobfuscate');
+assert.equal(route.calls.at(-1).params.max_steps, 2000); assert.equal(route.calls.at(-1).params.max_evidence, 12);
 assert.equal('rules' in route.calls.at(-1).params, false);
 await route.request('?type=struct&action=get&name=Packet&decl=ignored&ea=0x1000');
 assert.equal(route.calls.at(-1).params.action, 'get');
@@ -293,8 +300,8 @@ const toolsEnd = source.indexOf('// ── ig5dash', toolsStart);
 assert.ok(toolsStart >= 0 && toolsEnd > toolsStart, 'tool definitions must be present');
 const defineIg5Tools = vm.runInNewContext(
   source.slice(toolsStart, toolsEnd) + '\ndefineIg5Tools;',
-  { path, fs, publicEngineError, defineAdvancedTools, defineIntegrationTools, defineAnalysisTools, doctorWorker,
-    collectFunctionDossier, workspaceSchema, runWorkspace, captureDossier,
+  { path, fs, publicEngineError, defineAdvancedTools, defineIntegrationTools, defineAnalysisTools, defineCaptureTools: () => [], doctorWorker,
+    collectFunctionDossier, workspaceSchema, runWorkspace, captureDossier, recoveryProfileSchema, runRecoveryProfile, autonomyStatus,
     IG5_WRITE_TOOLS: vm.runInNewContext(source.slice(source.indexOf('const IG5_WRITE_TOOLS'), source.indexOf('function installApprovalGate')) + '\nIG5_WRITE_TOOLS;'),
     PLUGIN_ID: 'dsh-infinite-gen-5', PLUGIN_VERSION: '1.0.0', setTimeout, clearTimeout },
 );
@@ -303,6 +310,7 @@ let doctorMode = 'success';
 const mockManager = {
   analysis: { execute() { throw new Error('Data route fixture must not run analysis'); } },
   status: () => [],
+  remoteCleanupEvidence: () => ({ entries: [], totalStoredCleanedGenerations: 0, omitted: 0, partial: false }),
   spawnWorker() {
     if (doctorMode === 'spawnThrow') throw new Error(diagnostic);
     const child = new EventEmitter();
@@ -372,7 +380,7 @@ const workerContext = {
     attachEngine() { return { attachmentId: 'at', dbRevision: 0 }; }
     closeAttachment() {}
   },
-  path, process, publicEngineError, diagAppend: () => {}, WORKER: 'mock-worker.py', setTimeout, clearTimeout,
+  path, fs, process, publicEngineError, diagAppend: () => {}, WORKER: 'mock-worker.py', setTimeout, clearTimeout,
   spawn() {
     if (workerMode === 'spawnThrow') throw new Error(diagnostic);
     const child = new EventEmitter();
@@ -624,7 +632,7 @@ for (const expectedRevision of [undefined, 0]) {
 }
 console.log('Public queued tools: failed old session cannot transfer a write to a reopened attachment, with or without expected_revision; fresh calls still work.');
 workerContext.spawn = nativeSpawn;
-const missingRuntime = new WorkerManager({ ...cfg, pythonExe: path.join(process.env.TEMP, 'ig5-deliberately-missing-runtime.exe') });
+const missingRuntime = new WorkerManager({ ...cfg, pythonExe: path.join(os.tmpdir(), 'ig5-deliberately-missing-runtime.exe') });
 await assert.rejects(missingRuntime.open('C:\\fixtures\\sample.exe'), /ENOENT/);
 assert.equal(missingRuntime.sessions.size, 0, 'early spawn failure must be caught rather than become an uncaught error');
 

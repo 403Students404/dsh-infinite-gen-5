@@ -90,6 +90,8 @@ function Test-IG5ExcludedPath {
     if ($parts -contains '.git') { return $true }
     if ($parts[0] -eq 'plugin') { $parts = @($parts | Select-Object -Skip 1) }
     if ($parts[0] -eq '.downloads') { return $true }
+    if ($parts[0] -eq 'scratch') { return $true }
+    if ($parts.Count -eq 4 -and $parts[0] -eq 'adapters' -and $parts[1] -eq 'vmci' -and $parts[2] -eq 'native' -and $parts[3] -like '*.obj') { return $true }
     # Vendored upstream source trees retain every source path except their Git metadata.
     if ($parts.Count -ge 2 -and $parts[0] -eq 'third_party' -and $parts[1] -eq 'sources') { return $false }
     if ($parts -contains '__pycache__' -or $parts -contains '.pytest_cache' -or $parts -contains 'node_modules') { return $true }
@@ -240,6 +242,13 @@ function Copy-IG5Pack {
     }
 }
 
+function Test-IG5RuntimeVersion {
+    param([string]$AssetVersion, [string]$PluginVersion)
+    # 1.1 adds the Node capture lane without changing the sealed native engines.
+    # Keep the original manifests and SHA-256 pins byte-for-byte intact.
+    return ($AssetVersion -ceq $PluginVersion -or ($PluginVersion -ceq '1.1.0' -and $AssetVersion -ceq '1.0.0'))
+}
+
 function Write-IG5RuntimeManifest {
     param([Parameter(Mandatory)]$Validated, [Parameter(Mandatory)][string]$Destination, [string]$PluginVersion)
     if (-not $Validated.Legacy) { [IO.File]::Copy((ConvertTo-IG5IOPath $Validated.ManifestPath), (ConvertTo-IG5IOPath (Join-Path $Destination 'manifest.json')), $true); return }
@@ -341,6 +350,9 @@ function Assert-IG5PluginSource {
         'adapters/ghidra/local-project-path/local-project-path.patch','adapters/ghidra/local-project-path/NOTICE.txt','adapters/ghidra/local-project-path/README.md',
         'adapters/x64dbg/adapter.py','adapters/x64dbg/native/ig5-bridge.dp32','adapters/x64dbg/native/ig5-bridge.dp64','adapters/x64dbg/native/sha256.json',
         'scripts/runtime_pack.ps1','scripts/bootstrap_distribution.ps1','scripts/distribution.json','install.ps1','uninstall.ps1','cordis.patch.yml','README.md','HARNESS_PLUGIN.md','LICENSE','THIRD_PARTY_NOTICES.txt')
+    $sourcePackage = Read-IG5Text (Join-Path $Root 'package.json') | ConvertFrom-Json
+    if ([string]$sourcePackage.version -eq '1.1.0') { $required += @('capture_tools.js','source/capture_service.js','source/capture_proxy.js','source/capture_ca.js','source/capture_review.js','source/capture_payload.js','source/delivered_payload.js','source/capture_state_trace.js','source/protocol_state.js','adapters/ghidra/deobfuscation_analysis.py','adapters/ghidra/deobfuscation_symbolic.py') }
+    if ([string]$sourcePackage.version -eq '1.1.0') { $required += @('source/trace_jobs.js','worker/ig5_trace.py','worker/trace_analysis.py','worker/requirements-trace.txt','worker/trace_vendor/ig5-manifest.json','worker/trace_vendor/NOTICE.txt','worker/trace_vendor/triton.cp312-win_amd64.pyd','worker/trace_vendor/triton_library-1.0.0rc4.dist-info/RECORD','worker/trace_vendor/triton_library-1.0.0rc4.dist-info/LICENSE.txt','worker/trace_vendor/licenses/sources.json') }
     if (-not $CoreOnly) { $required += 'third_party/sources/manifest.json' }
     foreach ($skill in @('ig5-triage','ig5-deep-dive','ig5-patch-and-sign','ig5-diff','ig5-debug-live','ig5-crypto','ig5-protocol')) { $required += "skills/$skill/SKILL.md" }
     foreach ($relative in $required) { if (-not (Test-IG5Path (Resolve-IG5PackPath $Root $relative) Leaf)) { throw "安装源缺少插件文件: $relative" } }

@@ -28,7 +28,7 @@ const read = (type, engine, extra = {}) => new Promise((resolve, reject) => {
 try {
   // Proves Ghidra can bootstrap with the commercial runtime deliberately disabled.
   apply(ctx, { reverse: false, defaultEngine: 'ghidra', toolset: 'full', artifactDir: path.join(scratch, 'artifacts'), requestTimeoutMs: 120000 });
-  assert.equal(tools.size, 38);
+  assert.equal(tools.size, 40);
   const profile = await call('ig5_profile');
   const builtin = profile.engines.find((item) => item.id === 'reverse');
   assert.equal(builtin.available, true); assert.equal(builtin.provider, 'ghidra'); assert.equal(builtin.distribution, 'bundled');
@@ -49,6 +49,8 @@ try {
   assert.ok(intermediate.returned_instructions > 0); assert.ok(intermediate.blocks.some(block => block.instructions.length));
   assert.equal(intermediate._ig5.engine, 'ghidra');
   assert.ok((await call('ig5_ir', { engine: 'ghidra', ea, level: 'high' })).instructions.length > 0);
+  await assert.rejects(call('ig5_ir', { ea, level: 'raw', action: 'analyze', max_instructions: 256 }), /level=kernel: action.*max_instructions.*supported/);
+  assert.ok((await call('ig5_ir', { ea, level: 'raw', max_instructions: 256 })).instructions.length > 0);
   await call('ig5_rename', { ea, new_name: 'IG5Renamed', expected_revision: 0 });
   const after = await call('ig5_decompile', { ea });
   assert.equal(after.name, 'IG5Renamed'); assert.equal(after._ig5.dbRevision, 1);
@@ -70,8 +72,8 @@ try {
   const ghidra = await call('ig5_open', { path: target, engine: 'ghidra', background: false });
   assert.equal(reverse.artifactId, ghidra.artifactId); assert.equal(reverse.projectId, ghidra.projectId);
   assert.equal(reverse.engine, 'reverse'); assert.equal(reverse.provider, 'ghidra');
-  assert.ok(reverse.databasePath); assert.ok(ghidra.databasePath); assert.notEqual(reverse.databasePath, ghidra.databasePath);
-  assert.equal((await call('ig5_ir', { ea, level: 'raw' }))._ig5.engine, 'ghidra', 'IR retains Ghidra evidence when the primary engine is Reverse');
+  assert.ok(reverse.attachmentId); assert.ok(ghidra.attachmentId); assert.notEqual(reverse.attachmentId, ghidra.attachmentId);
+  assert.equal((await call('ig5_ir', { ea, level: 'raw' }))._ig5.engine, 'reverse', 'Implicit IR follows the default bundled Reverse session and retains its Ghidra provider');
   await call('ig5_rename', { engine: 'reverse', ea, new_name: 'UnifiedAdd' });
   await call('ig5_comment', { engine: 'reverse', ea, text: 'Cross-engine evidence' });
   assert.notEqual((await call('ig5_decompile', { engine: 'ghidra', ea })).name, 'UnifiedAdd', 'the destination database must remain unchanged before the explicit sync');

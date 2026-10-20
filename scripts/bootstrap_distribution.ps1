@@ -4,7 +4,7 @@ function Get-IG5DistributionDescriptor {
     param([string]$SourceRoot, [string]$PluginVersion)
     try { $d = Read-IG5Text (Join-Path $SourceRoot 'scripts\distribution.json') | ConvertFrom-Json }
     catch { throw 'Invalid scripts/distribution.json' }
-    if ($d.schemaVersion -ne 1 -or $d.pluginVersion -ne $PluginVersion -or $d.repository -cne 'Minglink/dsh-infinite-gen-5' -or
+    if ($d.schemaVersion -ne 1 -or -not (Test-IG5RuntimeVersion ([string]$d.pluginVersion) $PluginVersion) -or $d.repository -cne 'Minglink/dsh-infinite-gen-5' -or
         [string]$d.releaseTag -notmatch '^v1\.0\.0-[a-z0-9-]+$' -or [string]$d.assetName -notmatch '^IG5-1\.0\.0-Windows-x64-[a-z0-9-]+\.zip$') { throw 'Distribution identity/version is invalid' }
     foreach ($field in @('runtimeManifestSha256','sourceManifestSha256')) {
         if ([string]$d.$field -notmatch '^[a-f0-9]{64}$') { throw "Invalid distribution SHA-256: $field" }
@@ -240,7 +240,7 @@ function Assert-IG5DistributionAssets {
     $manifestPath = Join-Path $root 'manifest.json'
     try { $release = Read-IG5Text $manifestPath | ConvertFrom-Json }
     catch { throw 'DistributionRoot needs the complete release manifest.json and plugin/ directory' }
-    if ($release.schemaVersion -ne 1 -or $release.platform -ne 'win32-x64' -or $release.pluginVersion -ne $PluginVersion -or -not $release.files) { throw 'DistributionRoot release manifest identity/version is invalid' }
+    if ($release.schemaVersion -ne 1 -or $release.platform -ne 'win32-x64' -or $release.pluginVersion -ne $Descriptor.pluginVersion -or -not $release.files) { throw 'DistributionRoot release manifest identity/version is invalid' }
     $releaseFiles = @($release.files)
     foreach ($file in $releaseFiles) { if ([string]$file.path -eq 'manifest.json') { throw 'Release inventory must not include itself' } }
     $outerRecord = @{path='manifest.json';bytes=(New-Object IO.FileInfo (ConvertTo-IG5IOPath $manifestPath)).Length;sha256=(Get-IG5Hash $manifestPath)}
@@ -258,7 +258,7 @@ function Assert-IG5PinnedAssets {
         if ((Get-IG5Hash (Join-Path $pluginRoot $pin[0])) -ne $Descriptor.($pin[1])) { throw "Pinned distribution manifest SHA-256 mismatch: $($pin[0])" }
     }
     $runtime = Assert-IG5RuntimePack (Join-Path $pluginRoot 'runtimes')
-    if ($runtime.Manifest.pluginVersion -ne $PluginVersion) { throw 'Distribution runtime version mismatch' }
+    if ($runtime.Manifest.pluginVersion -ne $Descriptor.pluginVersion -or -not (Test-IG5RuntimeVersion ([string]$runtime.Manifest.pluginVersion) $PluginVersion)) { throw 'Distribution runtime version mismatch' }
     $sourcesRoot = Join-Path $pluginRoot 'third_party\sources'
     $sourceManifest = Read-IG5Text (Join-Path $sourcesRoot 'manifest.json') | ConvertFrom-Json
     $inventoryPaths = @($sourceManifest.sources | ForEach-Object { [string]$_.fileInventory })

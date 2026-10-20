@@ -105,7 +105,7 @@ $runtimeInput = if ($RuntimeSource) { Get-IG5FullPath $RuntimeSource } else { Jo
 Assert-IG5PluginSource $srcDir
 Assert-IG5FileInventory $srcDir $coreFiles 'core-after-preparation' -IgnoredPrefixes @('runtimes/','third_party/sources/')
 $validated = Assert-IG5RuntimePack $runtimeInput
-if ($validated.Manifest.pluginVersion -and [string]$validated.Manifest.pluginVersion -ne $pluginVersion) { throw "运行包版本与插件不符: $($validated.Manifest.pluginVersion) / $pluginVersion" }
+if ($validated.Manifest.pluginVersion -and -not (Test-IG5RuntimeVersion ([string]$validated.Manifest.pluginVersion) $pluginVersion)) { throw "运行包版本与插件不符: $($validated.Manifest.pluginVersion) / $pluginVersion" }
 Write-Host "[OK] 两引擎完整性验证通过：$($validated.Files) 个文件" -ForegroundColor Green
 $token = [Guid]::NewGuid().ToString('N')
 $stage = Assert-Child (Join-Path $pluginsDir ".ig5-stage-$token") $pluginsDir

@@ -31,9 +31,9 @@ const expectedNames = [
   'doctor', 'open', 'status', 'funcs', 'strings', 'decompile', 'xrefs', 'calls', 'bytes', 'search', 'listing', 'scan',
   'export_diff', 'cfg', 'slice', 'fingerprint', 'rename', 'patch_bytes', 'comment', 'analyze', 'set_type', 'undo',
   'run_idapython', 'dbg', 'struct', 'close', 'profile', 'stack', 'switches', 'switch_repair', 'vtables', 'microcode',
-  'bindiff', 'emulate', 'ir', 'sync', 'crypto', 'protocol',
+  'bindiff', 'emulate', 'ir', 'sync', 'crypto', 'protocol', 'capture', 'capture_control',
 ].map(v => 'ig5_' + v);
-const writeNames = ['rename', 'patch_bytes', 'comment', 'analyze', 'set_type', 'undo', 'run_idapython', 'dbg', 'struct', 'switch_repair', 'emulate', 'sync'].map(v => 'ig5_' + v);
+const writeNames = ['rename', 'patch_bytes', 'comment', 'analyze', 'set_type', 'undo', 'run_idapython', 'dbg', 'struct', 'switch_repair', 'emulate', 'sync', 'capture_control'].map(v => 'ig5_' + v);
 let failure, cleanupSucceeded = false, engineReports = [], approvalSequence = 0;
 const executionAgent = { id: 'public-catalog-acceptance' };
 const approvalState = { outcome: 'allowed-once', requests: [] };
@@ -154,16 +154,18 @@ try {
     assert.equal(allowed.kind, 'allow'); assert.equal(allowedDelegations, 1);
     approvalChecks.push({ tool: name, publicServiceRequested: true, rejectedDecision: 'deny', deniedDispatchCalls, allowedOnceDelegations: allowedDelegations });
   }
-  await check('ig5_profile', 'host', 'Full38 / Core8 / Full38 schemas', async () => {
+  await check('ig5_profile', 'host', 'Full40 / Core8 / Full40 schemas', async () => {
     assert.equal((await call('ig5_profile', { toolset: 'core' })).activeTools.length, 8); assert.equal(tools.size, 8);
-    const full = await call('ig5_profile', { toolset: 'full' }); assert.equal(full.activeTools.length, 38); assert.equal(tools.size, 38);
+    const full = await call('ig5_profile', { toolset: 'full' }); assert.equal(full.activeTools.length, 40); assert.equal(tools.size, 40);
     for (const engine of requestedEngines) assert.equal(full.engines.find(e => e.id === engine)?.available, true, engine + ' must actually be available');
     if (reverseProvider === 'bundled') {
       const reverse = full.engines.find(e => e.id === 'reverse');
       assert.equal(reverse.available, true); assert.equal(reverse.provider, 'ghidra'); assert.match(reverse.label, /内置/);
     }
-    return { core: 8, full: 38, approvalTools: approvalChecks.length };
+    return { core: 8, full: 40, approvalTools: approvalChecks.length };
   });
+  await check('ig5_capture', 'host', 'dormant independent capture status', async () => { const value = await call('ig5_capture', { action: 'status' }, undefined, null); assert.equal(value.running, false); return value; });
+  await check('ig5_capture_control', 'host', 'approved loopback listener lifecycle', async () => { const value = await call('ig5_capture_control', { action: 'start', scope: ['http://127.0.0.1:1'], port: 0 }, undefined, null); assert(value.running); const stopped = await call('ig5_capture_control', { action: 'stop', session_id: value.session_id }, undefined, null); assert.equal(stopped.running, false); return { started: true, stopped: true, networkExchangeValidation: 'scripts/test_capture_host.mjs and scripts/test_capture_proxy.mjs' }; });
   for (const engine of requestedEngines) {
     await check('ig5_doctor', engine, 'actual worker bootstrap', async () => { const value = await call('ig5_doctor', {}, engine); assert.equal(value.ok, true); return { ok: value.ok }; });
     for (const [index, target] of targets.entries()) await check('ig5_open', engine, 'generated version ' + (index + 1), async () => {
@@ -463,12 +465,12 @@ finally {
   const coverage = expectedNames.map(tool => ({ tool, passed: checks.some(row => row.tool === tool && row.status === 'passed'),
     checks: checks.filter(row => row.tool === tool), approval: approvalChecks.find(row => row.tool === tool) }));
   const covered = coverage.filter(row => row.passed).length;
-  const report = { schemaVersion: 1, ok: !failure && cleanupSucceeded && covered === 38, pluginRoot, sourceRoot,
+  const report = { schemaVersion: 1, ok: !failure && cleanupSucceeded && covered === expectedNames.length, pluginRoot, sourceRoot,
     requestedEngines, reverseProvider, executeDebugger, toolCount: expectedNames.length, passedToolCount: covered, approvalToolCount: approvalChecks.length,
     engineReports, coverage, checks, cleanupSucceeded, ...(failure ? { error: failure } : {}),
     execution: 'Real public definition.execute → native Reverse/Ghidra workers; real bundled Unicorn; x64dbg executes only a generated PE64.',
     hostBoundary: 'A controlled public approval.request service exercises the real plugin gate with agent/callId/signal. Rejected decisions must not call next; allowed-once delegates once. The actual DSH SDK dispatch is exercised separately in isolation by test_host_sdk.mjs. The desktop consent dialog is not verified by either suite.',
-    boundaries: ['One generated PE64 pair; no arbitrary-binary guarantee.', 'Unsupported engine/tool pairs are recorded separately and do not count as successful execution.', 'No Android/iOS native runtime claim.', 'Bundled Full38 uses independent Reverse/Ghidra databases with disclosed Ghidra provider and enabled x64dbg; no commercial installation required. Python compatibility is a documented subset, p-code stages are not proprietary microcode equivalents.'],
+    boundaries: ['One generated PE64 pair; no arbitrary-binary guarantee.', 'Unsupported engine/tool pairs are recorded separately and do not count as successful execution.', 'No Android/iOS native runtime claim.', 'Bundled Full40 uses independent Reverse/Ghidra databases with disclosed Ghidra provider and enabled x64dbg; no commercial installation required. Python compatibility is a documented subset, p-code stages are not proprietary microcode equivalents.'],
   };
   fs.mkdirSync(reportDirectory, { recursive: true }); fs.writeFileSync(reportFile, JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
   console.log(JSON.stringify({ ok: report.ok, passedToolCount: covered, approvalToolCount: approvalChecks.length, report: reportFile }));

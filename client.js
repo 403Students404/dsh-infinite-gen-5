@@ -1,6 +1,6 @@
 (() => {
   try {
-    /* 无限五代 (dsh-infinite-gen-5) v1.0.0 专业无头逆向工程工作台
+    /* 无限五代 (dsh-infinite-gen-5) v1.1.0 专业无头逆向工程工作台
        视觉系统深度对齐 DeepSeek Harness「上下文」原生设计语言：
        - 全量采用官方 CSS 变量 tokens (--dsw-alias-*, --ds-*, tabular-nums)
        - 原生卡片容器 (.ig5-card)、统计磁贴 (.ig5-stat)、分段胶囊选择器 (.ig5-kinds / .ig5-gran-btn)
@@ -27,7 +27,7 @@
         var inject = ["slots"];
         var PLUGIN_ID = "dsh-infinite-gen-5";
         var PANEL_ID = "ig5-workbench-panel";
-        var VERSION = "1.0.0";
+        var VERSION = "1.1.0";
         var WORKBENCH_TAB_LABEL = "IG5 逆向工作台";
 
         /* ── 诊断回路 ── */
@@ -574,10 +574,11 @@
         }
         function readData(type, target, params, engine, session) {
           var expected;
-          try { expected = ["analyses", "analysis_result", "approvals", "debug_state"].indexOf(type) === -1 ? captureReadSnapshot(session) : null; }
+          var captureRead = ["capture_status", "capture_history", "capture_detail"].indexOf(type) !== -1;
+          try { expected = !captureRead && ["analyses", "analysis_result", "approvals", "debug_state"].indexOf(type) === -1 ? captureReadSnapshot(session) : null; }
           catch (error) { return Promise.reject(error); }
           var base = { type: type, target: target || "" };
-          if (engine || ["analyses", "analysis_result"].indexOf(type) === -1) base.engine = engine || "reverse";
+          if (!captureRead && (engine || ["analyses", "analysis_result"].indexOf(type) === -1)) base.engine = engine || "reverse";
           Object.keys(params || {}).forEach(function (key) { if (params[key] !== undefined && params[key] !== null) base[key] = params[key]; });
           if (expected) base.expected_snapshot = JSON.stringify(expected);
           var query = new URLSearchParams(base);
@@ -803,7 +804,7 @@
         }
         function buildAnalysisDraft(kind, action, input, parameters, target, engine) {
           if (!["crypto", "protocol"].includes(kind)) throw new Error("请选择解密或协议分析");
-          var allowed = kind === "crypto" ? ["inspect", "transform", "recover", "verify"] : ["inspect", "capture", "decode", "infer"];
+          var allowed = kind === "crypto" ? ["inspect", "transform", "recover", "verify"] : ["inspect", "capture", "decode", "infer", "state_infer", "state_validate"];
           if (allowed.indexOf(action) < 0) throw new Error("分析操作无效");
           var extra = parameters ? JSON.parse(parameters) : {};
           if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("附加参数必须是 JSON 对象");
@@ -817,6 +818,8 @@
         function analysisTemplate(kind, action) {
           if (kind === "crypto" && action === "recover") return { recovery: { method: "auto", max_trials: 4096, max_candidates: 4, max_work_bytes: 16777216 } };
           if (kind === "protocol" && action === "infer") return { inference: { format: "stream", boundary: "unknown", min_frames: 3, max_candidates: 4 } };
+          if (kind === "protocol" && action === "state_infer") return { state_model: { merge: "future-equivalent", merge_depth: 2, max_traces: 64, max_events: 4096, max_states: 2048, max_work: 1000000 } };
+          if (kind === "protocol" && action === "state_validate") return { state_model: { result_id: "已保存的状态推断报告UUID", model: "prefix-tree" } };
           if (kind === "crypto" && action === "transform") return { recipe: { kind: "xor", key_ref: { ref: "sha256:完整候选密钥引用", result_id: "恢复报告UUID" } } };
           if (kind === "protocol" && action === "decode") return { schema: { fields: [] }, framing: { type: "delimiter", delimiterHex: "0a", includeDelimiter: true } };
           return {};
@@ -954,6 +957,7 @@
             activeTab === "listing" && el(Ig5ListingView, { key: viewKey, target: selectedTarget, engine: engine, session: currentSession, inputActions: props.inputActions }),
             activeTab === "scan" && el(Ig5ScanView, { key: viewKey, target: selectedTarget, engine: engine, session: currentSession }),
             activeTab === "analysis" && el(Ig5AnalysisView, { key: viewKey, target: selectedTarget, engine: engine, inputActions: props.inputActions }),
+            activeTab === "capture" && el(Ig5CaptureView, { inputActions: props.inputActions }),
             activeTab === "patches" && el(Ig5PatchesView, { key: viewKey, target: selectedTarget, engine: engine }),
             activeTab === "runtime" && el(Ig5RuntimeView, { sessions: allSessions.filter(function (s) { return s.engine === "x64dbg"; }), refresh: feed && feed.now }),
             activeTab === "tools" && el(Ig5ToolsMatrixView, { dash: dash, session: currentSession, feed: feed })
@@ -1009,13 +1013,45 @@
         function Ig5IrView(props) {
           var levelPair = react.useState("high"), level = levelPair[0], setLevel = levelPair[1];
           var pair = react.useState({ loading: true, data: null, error: null }), state = pair[0], setState = pair[1];
+          // Status polling updates uptime/progress; only evidence identity changes invalidate native IR.
+          var readScope = (props.engine || "reverse") + "\n" + normalizedTarget(props.target) + "\n" + props.ea + "\n" + level + "\n" + JSON.stringify([props.session && props.session.key].concat(readIdentityFields.map(function (field) { return props.session && props.session[field]; })));
           react.useEffect(function () {
-            var alive = true; setState({ loading: true, data: null, error: null });
-            readData("ir", props.target, { ea: props.ea, level: level, limit: 120 }, props.engine, props.session).then(function (data) { if (alive) setState({ loading: false, data: data, error: null }); }).catch(function (error) { if (alive) setState({ loading: false, data: null, error: String(error.message || error) }); });
+            var alive = true; setState({ scope: readScope, loading: true, data: null, error: null });
+            var type = level === "deobfuscate" ? "microcode" : "ir";
+            var query = level === "deobfuscate" ? { ea: props.ea, action: "deobfuscate", max_steps: 100000, max_evidence: 128 } : { ea: props.ea, level: level, limit: 120 };
+            readData(type, props.target, query, props.engine, props.session).then(function (data) { if (alive) setState({ scope: readScope, loading: false, data: data, error: null }); }).catch(function (error) { if (alive) setState({ scope: readScope, loading: false, data: null, error: String(error.message || error) }); });
             return function () { alive = false; };
-          }, [props.target, props.engine, props.ea, level]);
+          }, [readScope]);
+          if (state.scope !== readScope) state = { loading: true, data: null, error: null };
           var serialized = state.data ? JSON.stringify(state.data, null, 2) : "";
-          return el("div", null, el("div", { className: "ig5-form-row" }, el("b", null, "Ghidra p-code · " + level), el("select", { className: "ig5-select", "aria-label": "p-code 层级", value: level, onChange: function (e) { setLevel(e.target.value); } }, el("option", { value: "high" }, "High p-code"), el("option", { value: "raw" }, "Raw p-code"))), el("p", { className: "ig5-card-sub" }, "Ghidra IR 保留自身语义，不对应 Reverse 微码成熟度。"), state.loading ? el("p", null, "读取 IR…") : state.error ? el("p", { className: "ig5-error", role: "alert" }, state.error) : el("pre", { className: "ig5-code-box ig5-mono" }, serialized.slice(0, 64000)), serialized.length > 64000 ? el("p", { className: "ig5-card-sub" }, "视图已截断到 64,000 字符；请按范围读取完整工件。") : null);
+          var overlay = state.data && state.data.deobfuscation, summary = null;
+          if (level === "deobfuscate" && !state.loading && !state.error) {
+            if (overlay && typeof overlay === "object" && !Array.isArray(overlay)) {
+              var scalar = function (value) { return typeof value === "string" || typeof value === "number" && Number.isFinite(value) ? String(value).slice(0, 160) : "未提供"; };
+              var count = function (value) { return Array.isArray(value) ? String(value.length) : "未提供"; };
+              var branches = Array.isArray(overlay.branchDecisions) ? overlay.branchDecisions : [];
+              var routes = Array.isArray(overlay.dispatcherRoutes) ? overlay.dispatcherRoutes : [];
+              var branchLines = branches.slice(0, 8).map(function (item) {
+                if (!item || typeof item !== "object") return "分支证据不可读";
+                return "块 " + scalar(item.block) + " @ " + scalar(item.ea) + "：条件 " + scalar(item.condition) + " → 块 " + scalar(item.destination) + "；排除 " + (Array.isArray(item.discarded) ? item.discarded.slice(0, 8).map(scalar).join(", ") || "无" : "未提供");
+              });
+              var routeLines = routes.slice(0, 8).map(function (item) {
+                if (!item || typeof item !== "object") return "路径证据不可读";
+                var steps = Array.isArray(item.path) ? item.path.slice(0, 8).map(function (step) { return step && typeof step === "object" ? scalar(step.block) + " → " + scalar(step.destination) + " (条件 " + scalar(step.condition) + ")" : "未提供"; }).join("；") : "未提供";
+                var assignments = Array.isArray(item.stateEvidence) ? item.stateEvidence.slice(0, 8).map(function (assignment) { return assignment && typeof assignment === "object" ? "SSA " + scalar(assignment.ssa) + " = " + scalar(assignment.value) + " / " + scalar(assignment.width) + " 位" : "未提供"; }).join("；") : "未提供";
+                return "入口 " + scalar(item.predecessor) + " → 分发器 " + scalar(item.dispatcher) + " → 目标 " + scalar(item.destination) + "\n  路径：" + steps + (item.pathTruncated === true || Array.isArray(item.path) && item.path.length > 8 ? " [路径已截断]" : "") + "\n  状态：" + assignments + (item.stateEvidenceTruncated === true || Array.isArray(item.stateEvidence) && item.stateEvidence.length > 8 ? " [赋值已截断]" : "");
+              });
+              summary = el("section", { className: "ig5-card", "aria-label": "去混淆结论摘要" },
+                el("div", { className: "ig5-card-title" }, el("b", null, "去混淆结论"), el("span", { className: "ig5-chip read" }, "只读证据")),
+                el("p", { className: "ig5-card-sub" }, "算法：" + scalar(overlay.algorithm) + " · 分析范围：" + (overlay.partial === true ? "不完整" : overlay.partial === false ? "完整" : "未提供") + " · 证据截断：" + (overlay.evidenceTruncated === true ? "是" : overlay.evidenceTruncated === false ? "否" : "未提供")),
+                el("p", null, "已返回分支证明：" + count(overlay.branchDecisions) + " · 不可达块：" + count(overlay.unreachableBlocks) + " · 分发器路径：" + count(overlay.dispatcherRoutes) + " · 未决项：" + count(overlay.unresolved)),
+                el("p", null, "局部表达式化简：" + count(overlay.expressionSimplifications) + " · 间接目标依赖切片：" + count(overlay.indirectTransfers)),
+                el("p", { className: "ig5-card-sub" }, overlay.partial === true ? "全局控制流证明保留为未知；局部表达式等价仅说明指定 SSA 运算，不能推出完整函数恢复。返回 0 条不代表不存在相应行为。" : "数量按返回证据计；截断时不能作为总量。局部表达式与分发器路径不代表已改写程序或完成运行验证。"),
+                branches.length ? el("div", null, el("b", null, "分支证明"), el("pre", { className: "ig5-code-box ig5-mono" }, branchLines.join("\n")), branches.length > 8 ? el("p", { className: "ig5-card-sub" }, "摘要仅显示前 8 条分支证明；其余见原始结果。") : null) : null,
+                routes.length ? el("div", null, el("b", null, "分发器入口路径"), el("pre", { className: "ig5-code-box ig5-mono" }, routeLines.join("\n\n")), routes.length > 8 ? el("p", { className: "ig5-card-sub" }, "摘要仅显示前 8 条分发器路径；其余见原始结果。") : null) : null);
+            } else summary = el("p", { className: "ig5-card-sub" }, "未返回去混淆摘要；请查看原始结果中的状态。");
+          }
+          return el("div", null, el("div", { className: "ig5-form-row" }, el("b", null, "Ghidra p-code · " + level), el("select", { className: "ig5-select", "aria-label": "p-code 层级", value: level, onChange: function (e) { setLevel(e.target.value); } }, el("option", { value: "high" }, "High p-code"), el("option", { value: "raw" }, "Raw p-code"), el("option", { value: "deobfuscate" }, "去混淆分析"))), el("p", { className: "ig5-card-sub" }, level === "deobfuscate" ? "基于真实 SSA 的有界常量传播、恒定分支和分发器路径分析。只生成分析覆盖层，不修改程序；未知内存、调用和间接跳转保留未决。" : "Ghidra IR 保留自身语义，不对应 Reverse 微码成熟度。"), summary, state.loading ? el("p", null, "读取 IR…") : state.error ? el("p", { className: "ig5-error", role: "alert" }, state.error) : el("pre", { className: "ig5-code-box ig5-mono", "aria-label": "IR 原始结果" }, serialized.slice(0, 64000)), serialized.length > 64000 ? el("p", { className: "ig5-card-sub" }, "视图已截断到 64,000 字符；请按范围读取完整工件。") : null);
         }
         function Ig5OverviewCard(props) {
           var session = props.currentSession;
@@ -1143,6 +1179,7 @@
             { id: "listing", label: "📑 节段/符号/结构体", tag: null },
             { id: "scan", label: "🛡 熵与指纹侦测", tag: null },
             { id: "analysis", label: "🔐 解密与协议", tag: null },
+            { id: "capture", label: "🌐 流量捕获", tag: null },
             { id: "patches", label: "⚡ 补丁审计与回滚", tag: null },
             { id: "runtime", label: "▶ 运行态（只读）", tag: null },
             { id: "tools", label: "🧰 工具能力目录", tag: null },
@@ -2006,6 +2043,195 @@
           );
         }
 
+        // Capture reads are local snapshots. Starting listeners and sending requests only create composer drafts.
+        function capturePreview(value, maximum) {
+          var limit = maximum || 64000;
+          var text = typeof value === "string" ? value : JSON.stringify(value === undefined ? null : value, null, 2);
+          return { text: text.slice(0, limit), truncated: text.length > limit };
+        }
+        function buildCaptureDraft(action, parameters) {
+          var read = ["export", "review", "inspect_payload", "materialize"].indexOf(action) !== -1;
+          if (["start", "stop", "replay", "export", "review", "inspect_payload", "materialize"].indexOf(action) === -1) throw new Error("未知流量操作");
+          return "请先调用 ig5_profile toolset=full，然后调用 " + (read ? "ig5_capture" : "ig5_capture_control") + "，参数：\n" + JSON.stringify(Object.assign({}, parameters || {}, { action: action }), null, 2);
+        }
+        function CaptureMessage(props) {
+          var message = props.message;
+          if (!message) return null;
+          var body = message.body || {}, headers = capturePreview(message.headers || {}), preview = capturePreview(body.previewText !== undefined ? body.previewText : body.previewHex || "");
+          return el("div", { className: "ig5-card" },
+            el("b", null, props.label + (message.statusCode ? " · " + message.statusCode : "")),
+            el("p", { className: "ig5-card-sub" }, "头部（敏感字段已脱敏）"),
+            el("pre", { className: "ig5-code-box ig5-mono" }, headers.text),
+            el("p", { className: "ig5-card-sub" }, "正文 · " + (body.bytes || 0) + " 字节 · " + (body.previewText !== undefined ? "文本预览" : "十六进制预览")),
+            el("pre", { className: "ig5-code-box ig5-mono" }, preview.text),
+            body.representation ? el("p", { className: "ig5-card-sub" }, body.representation) : null,
+            body.ref ? el("p", { className: "ig5-card-sub ig5-mono" }, "捕获字节引用：" + body.ref) : null,
+            body.truncated ? el("p", { className: "ig5-card-sub", role: "status" }, "正文捕获已截断；保留的字节不代表完整报文。") : null,
+            body.previewTruncated || preview.truncated || headers.truncated ? el("p", { className: "ig5-card-sub" }, "当前预览已截断，可通过导出读取已保留的正文。") : null);
+        }
+        function Ig5CaptureView(props) {
+          var statusPair = react.useState({ data: null, loading: false, error: "" }), status = statusPair[0], setStatus = statusPair[1];
+          var historyPair = react.useState({ items: [], offset: 0, ready: false }), history = historyPair[0], setHistory = historyPair[1];
+          var detailPair = react.useState(null), detail = detailPair[0], setDetail = detailPair[1];
+          var scopePair = react.useState(""), scope = scopePair[0], setScope = scopePair[1];
+          var portPair = react.useState("0"), port = portPair[0], setPort = portPair[1];
+          var tlsPair = react.useState(false), tlsEnabled = tlsPair[0], setTlsEnabled = tlsPair[1];
+          var draftPair = react.useState(""), draft = draftPair[0], setDraft = draftPair[1];
+          var noticePair = react.useState(""), notice = noticePair[0], setNotice = noticePair[1];
+          var statusGate = react.useRef(makeRequestGate()), historyGate = react.useRef(makeRequestGate()), detailGate = react.useRef(makeRequestGate());
+          var sessionId = status.data && status.data.session_id;
+          var selected = detail && detail.data;
+          var websocket = selected && selected.protocol === "websocket";
+          var deliveredBody = selected && selected.response && selected.response.body;
+          var deliveredHeaders = selected && selected.response && selected.response.headers || {};
+          var deliveredEncoding = String(deliveredHeaders["content-encoding"] || "identity");
+          var hasDeliveredPayload = !!(selected && !selected.encrypted && !selected.websocketHandshake && deliveredBody && deliveredBody.ref && deliveredBody.bytes > 0 && (!websocket || selected.websocket && selected.websocket.direction === "server_to_client"));
+          var deliveredPartial = !!(selected && (!selected.complete || selected.response && selected.response.truncated || deliveredBody && deliveredBody.truncated || selected.response && selected.response.statusCode === 206 || deliveredHeaders["content-range"] || websocket && selected.websocket && (!selected.websocket.fin || selected.websocket.opcode === 0)));
+          var deliveredNeedsDecoding = deliveredEncoding.trim().toLowerCase() !== "identity" || !!(websocket && selected.websocket && (selected.websocket.compressed || [1, 2].indexOf(selected.websocket.opcode) === -1));
+          function resetHistory() { historyGate.current.next(); detailGate.current.next(); setHistory({ items: [], offset: 0, ready: false }); setDetail(null); setDraft(""); setNotice(""); }
+          function refreshStatus() {
+            var ticket = statusGate.current.next(); resetHistory();
+            setStatus({ data: null, loading: true, error: "" });
+            readData("capture_status").then(function (data) {
+              if (!statusGate.current.isCurrent(ticket)) return;
+              if (!data || typeof data.running !== "boolean") throw new Error("流量状态格式无效");
+              setStatus({ data: data, loading: false, error: "" });
+            }).catch(function (error) { if (statusGate.current.isCurrent(ticket)) setStatus({ data: null, loading: false, error: String(error.message || error) }); });
+          }
+          react.useEffect(function () {
+            refreshStatus();
+            return function () { statusGate.current.next(); historyGate.current.next(); detailGate.current.next(); };
+          }, []);
+          function readHistory(offset) {
+            var ticket = historyGate.current.next(), expectedSession = sessionId;
+            detailGate.current.next(); setDetail(null); setDraft(""); setNotice("");
+            setHistory({ items: [], offset: offset, loading: true, ready: false });
+            readData("capture_history", "", { offset: offset, limit: 20, session_id: expectedSession }).then(function (data) {
+              if (!historyGate.current.isCurrent(ticket)) return;
+              if (!data || !Array.isArray(data.items) || data.items.length > 20 || (expectedSession && data.session_id !== expectedSession) || data.items.some(function (item) { return !item || typeof item.id !== "string" || item.session_id !== data.session_id; })) throw new Error("流量会话已变化或数据格式无效，请刷新状态后重试");
+              setHistory(Object.assign({}, data, { offset: offset, loading: false, ready: true }));
+            }).catch(function (error) { if (historyGate.current.isCurrent(ticket)) setHistory({ items: [], offset: offset, loading: false, ready: false, error: String(error.message || error) }); });
+          }
+          function inspect(item) {
+            var ticket = detailGate.current.next(); setDraft(""); setNotice(""); setDetail({ id: item.id, loading: true });
+            readData("capture_detail", "", { id: item.id, session_id: item.session_id }).then(function (data) {
+              if (!detailGate.current.isCurrent(ticket)) return;
+              if (!data || data.id !== item.id || data.session_id !== item.session_id) throw new Error("流量详情身份已变化，请重新读取");
+              setDetail({ id: item.id, data: data, loading: false });
+            }).catch(function (error) { if (detailGate.current.isCurrent(ticket)) setDetail({ id: item.id, loading: false, error: String(error.message || error) }); });
+          }
+          function createDraft(action, body) {
+            try {
+              var args = {};
+              if (action === "start") {
+                var entries = scope.split(/[,\n]/).map(function (value) { return value.trim(); }).filter(Boolean);
+                if (!entries.length || entries.length > 32 || entries.some(function (value) {
+                  try {
+                    var origin = new URL(value);
+                    return value.length > 2048 || /[\\\s]/.test(value) || ["http:", "https:"].indexOf(origin.protocol) === -1 || origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash;
+                  } catch (_) { return true; }
+                })) throw new Error("请填写明确的 HTTP/HTTPS 目标范围，仅协议、主机和端口，多个地址用换行或逗号分隔");
+                if (!/^\d{1,5}$/.test(port) || Number(port) > 65535) throw new Error("监听端口须为 0–65535，0 表示自动分配");
+                args = { port: Number(port), scope: entries };
+                if (tlsEnabled) args.tls = true;
+              } else if (action === "stop") {
+                if (sessionId) args.session_id = sessionId;
+              } else if (["replay", "export", "review", "inspect_payload", "materialize"].indexOf(action) !== -1) {
+                if (!selected || selected.encrypted) throw new Error("请先读取一条可用的明文 HTTP 记录");
+                if ((action === "replay" || action === "review") && (websocket || selected.websocketHandshake)) throw new Error("WebSocket 帧或升级握手请使用载荷导出，不支持 HTTP 重放或被动检查");
+                if (action === "replay" && (!selected.complete || selected.request && selected.request.truncated)) throw new Error("重放需要完整捕获的请求，请核对完整性状态");
+                if (action === "inspect_payload" || action === "materialize") {
+                  if (!hasDeliveredPayload) throw new Error("当前记录没有可用的服务端下发载荷，请选择响应或服务端 WebSocket 帧");
+                  if (action === "materialize" && deliveredPartial) throw new Error("载荷尚不完整，请先补齐资源或重组分片；可先分析或导出已捕获字节");
+                  if (action === "materialize" && deliveredNeedsDecoding) throw new Error("载荷仍有编码或不支持的帧类型，请先解码或重组后保存逆向样本");
+                }
+                args = { id: selected.id, session_id: selected.session_id };
+                if (action === "export" || action === "inspect_payload" || action === "materialize") args.body = body;
+              }
+              setDraft(buildCaptureDraft(action, args)); setNotice("已生成可编辑草稿，尚未发送或执行。");
+            } catch (error) { setNotice(String(error.message || error)); }
+          }
+          function insertDraft() {
+            try {
+              var actions = props.inputActions;
+              if (!actions || typeof actions.captureInsertion !== "function" || typeof actions.insertText !== "function") { setNotice("请复制下方草稿到会话，核对参数后发送。"); return; }
+              var insertion = actions.captureInsertion();
+              if (!draft) return;
+              if (!actions.insertText("\n" + draft + "\n", insertion)) { setNotice("编辑器内容已变化，请重新插入或复制草稿。"); return; }
+              if (typeof actions.persistDraft === "function") actions.persistDraft();
+              setNotice("已插入会话草稿，尚未发送或执行。");
+            } catch (error) { setNotice("插入失败：" + String(error.message || error)); }
+          }
+          return el("div", null,
+            el("div", { className: "ig5-card" },
+              el("div", { className: "ig5-card-title-text" }, "🌐 五代流量捕获"),
+              el("p", { className: "ig5-card-sub" }, "独立本机 HTTP/HTTPS 代理。启动后将目标应用的代理配置为下方监听地址，显式读取捕获记录。HTTPS 明文需要启用解密并由目标客户端信任捕获 CA；未启用时 CONNECT 仅保留加密隧道元数据。"),
+              el("button", { className: "ig5-btn", disabled: status.loading, onClick: refreshStatus }, "刷新捕获状态"),
+              status.loading ? el("p", { role: "status" }, "读取捕获状态…") : null,
+              status.error ? el("p", { className: "ig5-error", role: "alert" }, status.error) : null,
+              status.data ? el("div", null,
+                el("p", { className: "ig5-mono" }, status.data.running ? "监听中 · " + status.data.host + ":" + status.data.port : "捕获已停止"),
+                el("p", { className: "ig5-card-sub" }, status.data.tlsInterceptEnabled ? "HTTPS 解密已启用 · 客户端需信任本机捕获 CA" : "HTTPS 解密未启用 · CONNECT 正文保持加密"),
+                status.data.tlsInterceptEnabled && status.data.certificate ? el("div", null,
+                  el("p", { className: "ig5-card-sub ig5-mono" }, "客户端信任证书：" + status.data.certificate.certificatePath),
+                  el("p", { className: "ig5-card-sub ig5-mono" }, "SHA-256 指纹：" + status.data.certificate.fingerprint256)) : null,
+                el("p", { className: "ig5-card-sub" }, "已保留 " + (status.data.stored || 0) + " 条 · 丢弃 " + (status.data.dropped || 0) + " 条"),
+                status.data.scope && status.data.scope.length ? el("p", { className: "ig5-card-sub" }, "当前范围：" + status.data.scope.join(", ")) : null,
+                sessionId ? el("p", { className: "ig5-card-sub ig5-mono" }, "捕获会话：" + sessionId) : null) : null,
+              el("div", { className: "ig5-form-row" },
+                el("input", { className: "ig5-input", "aria-label": "捕获目标范围", value: scope, placeholder: "http://localhost:3000（明确目标范围）", onChange: function (event) { setScope(event.target.value); setDraft(""); } }),
+                el("input", { className: "ig5-input", "aria-label": "捕获监听端口", value: port, inputMode: "numeric", onChange: function (event) { setPort(event.target.value); setDraft(""); } })),
+              el("label", { className: "ig5-card-sub" }, el("input", { type: "checkbox", "aria-label": "启用 HTTPS 解密", checked: tlsEnabled, onChange: function (event) { setTlsEnabled(event.target.checked); setDraft(""); } }), "启用 HTTPS 解密（需在目标客户端信任捕获 CA）"),
+              el("button", { className: "ig5-btn", onClick: function () { createDraft("start"); } }, "生成启动审批草稿"),
+              el("button", { className: "ig5-btn", onClick: function () { createDraft("stop"); } }, "生成停止审批草稿")),
+            el("div", { className: "ig5-card" },
+              el("div", { className: "ig5-form-row" },
+                el("b", null, "HTTP 捕获记录"),
+                el("button", { className: "ig5-btn", disabled: status.loading || history.loading || !sessionId, onClick: function () { readHistory(0); } }, "读取最新记录"),
+                el("button", { className: "ig5-btn", disabled: history.loading || !history.ready || history.offset < 20, onClick: function () { readHistory(Math.max(0, history.offset - 20)); } }, "上一页流量"),
+                el("button", { className: "ig5-btn", disabled: history.loading || !history.ready || !history.hasMore, onClick: function () { readHistory(history.offset + 20); } }, "下一页流量")),
+              history.loading ? el("p", { role: "status" }, "读取本机捕获记录…") : null,
+              history.error ? el("p", { className: "ig5-error", role: "alert" }, history.error) : null,
+              !history.ready && !history.loading && !history.error ? el("p", { className: "ig5-card-sub" }, "按需读取，每页最多 20 条；不会自动轮询流量。") : null,
+              history.ready ? el("p", { className: "ig5-card-sub" }, "偏移 " + history.offset + " · 本页 " + history.items.length + " 条" + (Number.isSafeInteger(history.total) ? " · 共 " + history.total + " 条" : "")) : null,
+              history.ready && !history.items.length ? el("p", { className: "ig5-card-sub" }, "当前页没有捕获记录。") : null,
+              history.items.length ? el("div", { className: "ig5-table-wrap" }, el("table", { className: "ig5-table ig5-mono" },
+                el("thead", null, el("tr", null, ["请求", "状态", "正文/完整性"].map(function (label) { return el("th", { key: label }, label); }))),
+                el("tbody", null, history.items.map(function (item) { return el("tr", { key: item.id, className: detail && detail.id === item.id ? "selected" : "" },
+                  el("td", null, el("button", { className: "ig5-btn", onClick: function () { inspect(item); }, title: item.url }, String(item.method || "HTTP") + " " + String(item.url || "").slice(0, 180))),
+                  el("td", null, item.statusCode || "待完成"),
+                  el("td", null, item.encrypted ? "CONNECT 加密隧道" : item.protocol === "websocket" ? "WebSocket 帧" : item.truncated ? "已截断" : item.complete ? "已完成" : "捕获中")); })))) : null),
+            detail && detail.loading ? el("p", { role: "status" }, "读取选中报文…") : null,
+            detail && detail.error ? el("p", { className: "ig5-error", role: "alert" }, detail.error) : null,
+            selected ? el("div", { className: "ig5-card" },
+              el("b", { className: "ig5-mono" }, selected.method + " " + selected.url),
+              selected.tlsDecrypted ? el("p", { className: "ig5-card-sub" }, "HTTPS 明文 · 来自已启用的本机 TLS 解密会话") : null,
+              websocket && selected.websocket ? el("div", { className: "ig5-card-sub" },
+                el("p", null, "WebSocket 帧 · " + (selected.websocket.direction === "client_to_server" ? "客户端 → 服务端" : "服务端 → 客户端") + " · opcode " + selected.websocket.opcode + " · FIN=" + String(selected.websocket.fin)),
+                el("p", null, selected.websocket.compressed ? "压缩帧：载荷保留压缩编码，尚未解压或重组消息。" : "载荷已去掩码；按帧保存，尚未重组消息。"),
+                el("p", null, selected.websocket.fin && selected.websocket.opcode !== 0 ? "FIN 已设置；单帧记录不证明完整会话或应用消息语义。" : "分片／延续帧：导出载荷不代表完整应用消息。")) : null,
+              selected.websocketHandshake ? el("p", { className: "ig5-card-sub" }, "WebSocket 升级握手，后续帧单独保存。") : null,
+              selected.encrypted ? el("p", { className: "ig5-card-sub" }, "HTTPS CONNECT 加密隧道：当前仅有连接元数据，没有解密后的 HTTP 请求或响应正文。") : el("div", null,
+                el(CaptureMessage, { label: websocket ? "客户端载荷" : "请求", message: selected.request }), el(CaptureMessage, { label: websocket ? "服务端载荷" : "响应", message: selected.response }),
+                !websocket && !selected.websocketHandshake ? el("button", { className: "ig5-btn", disabled: !selected.complete || selected.request && selected.request.truncated, onClick: function () { createDraft("replay"); } }, "生成重放审批草稿") : null,
+                !websocket && !selected.websocketHandshake ? el("button", { className: "ig5-btn", onClick: function () { createDraft("review"); } }, "生成被动检查草稿") : null,
+                el("button", { className: "ig5-btn", disabled: !selected.request || !selected.request.body || !selected.request.body.ref, onClick: function () { createDraft("export", "request"); } }, "生成请求正文导出草稿"),
+                el("button", { className: "ig5-btn", disabled: !selected.response || !selected.response.body || !selected.response.body.ref, onClick: function () { createDraft("export", "response"); } }, "生成响应正文导出草稿"),
+                el("div", { className: "ig5-card", style: { marginTop: 12 } },
+                  el("b", null, "下发载荷 → 静态逆向"),
+                  el("p", { className: "ig5-card-sub" }, "下发载荷是本次响应或服务端帧实际返回的内容，不能据此看到未返回的服务器内部代码。下方操作只生成会话草稿；查看、分析或保存脚本均不执行脚本。"),
+                  el("p", { className: "ig5-card-sub" }, "先分析载荷格式与编码，再保存样本；后续按格式、架构与引擎实际支持选择静态分析。"),
+                  deliveredEncoding.trim().toLowerCase() !== "identity" ? el("p", { className: "ig5-card-sub" }, "响应 Content-Encoding：" + deliveredEncoding.slice(0, 128) + "；需先在预算内解码，编码字节不能直接视为逆向样本。") : null,
+                  websocket && selected.websocket && selected.websocket.compressed ? el("p", { className: "ig5-card-sub" }, "WebSocket 压缩载荷需结合协商参数与上下文解压；单帧字节尚不是已解码的文件。") : null,
+                  websocket && selected.websocket && [1, 2].indexOf(selected.websocket.opcode) === -1 ? el("p", { className: "ig5-card-sub" }, "当前是 WebSocket 延续帧或控制帧，不能直接视为完整下发文件。") : null,
+                  deliveredPartial ? el("p", { className: "ig5-card-sub", role: "status" }, "载荷尚不完整：捕获中断、正文截断、HTTP 部分资源或 WebSocket 分片需先补齐；可分析已捕获字节，暂不保存为完整逆向样本。") : null,
+                  !hasDeliveredPayload ? el("p", { className: "ig5-card-sub" }, "当前记录没有可用的服务端下发正文。") : null,
+                  el("button", { className: "ig5-btn", disabled: !hasDeliveredPayload, onClick: function () { createDraft("inspect_payload", "response"); } }, "分析下发载荷"),
+                  el("button", { className: "ig5-btn", disabled: !hasDeliveredPayload || deliveredPartial || deliveredNeedsDecoding, onClick: function () { createDraft("materialize", "response"); } }, "保存为逆向样本")))) : null,
+            draft ? el("div", { className: "ig5-card" }, el("textarea", { className: "ig5-textarea ig5-mono", "aria-label": "待发送流量工具草稿", value: draft, onChange: function (event) { setDraft(event.target.value); } }), el("button", { className: "ig5-btn", onClick: insertDraft }, "插入会话草稿（待发送）")) : null,
+            notice ? el("p", { className: "ig5-card-sub", role: "status" }, notice) : null);
+        }
+
         function AnalysisDraft(props) {
           var lanePair = react.useState("crypto"), lane = lanePair[0], setLane = lanePair[1];
           var actionPair = react.useState("inspect"), action = actionPair[0], setAction = actionPair[1];
@@ -2046,12 +2272,13 @@
             el("p", { className: "ig5-card-sub" }, "提供数据来源与显式参数；此编辑器只生成草稿。运行样本与回写数据库仍使用对应审批工具。"),
             el("div", { className: "ig5-form-row" },
               el("select", { className: "ig5-input", "aria-label": "数据分析领域", value: lane, onChange: function (e) { setLane(e.target.value); setAction("inspect"); setParameters("{}"); setDraft(""); } }, el("option", { value: "crypto" }, "解密与配置"), el("option", { value: "protocol" }, "协议与报文")),
-              el("select", { className: "ig5-input", "aria-label": "数据分析操作", value: action, onChange: function (e) { setAction(e.target.value); setDraft(""); } }, (lane === "crypto" ? ["inspect", "transform", "recover", "verify"] : ["inspect", "capture", "decode", "infer"]).map(function (item) { return el("option", { key: item, value: item }, item); })),
+              el("select", { className: "ig5-input", "aria-label": "数据分析操作", value: action, onChange: function (e) { setAction(e.target.value); setDraft(""); } }, (lane === "crypto" ? ["inspect", "transform", "recover", "verify"] : ["inspect", "capture", "decode", "infer", "state_infer", "state_validate"]).map(function (item) { return el("option", { key: item, value: item }, item); })),
               el("select", { className: "ig5-input", "aria-label": "分析数据来源", value: inputType, onChange: function (e) { setInputType(e.target.value); setDraft(""); } }, ["path", "ref", "hex", "base64"].map(function (item) { return el("option", { key: item, value: item }, item); }))),
             el("input", { className: "ig5-input ig5-mono", "aria-label": "分析输入文件或字节", value: value, placeholder: inputType === "path" ? "本机输入文件路径" : inputType === "ref" ? "sha256:…" : "完整编码字节", onChange: function (e) { setValue(e.target.value); setDraft(""); } }),
             inputType === "ref" ? el("input", { className: "ig5-input ig5-mono", "aria-label": "来源分析报告 ID", value: producer, placeholder: "来源报告 UUID（填写后保留引用链；省略则无绑定来源）", onChange: function (e) { setProducer(e.target.value); setDraft(""); } }) : null,
             action === "recover" ? el("p", { className: "ig5-card-sub" }, "自动恢复在预算内搜索单字节／重复 XOR，或验证显式候选及 key_source 提取的 AES 密钥。统计评分是候选；提供已知明文、expected 或 GCM 认证可核验。密钥只保存敏感引用，完整候选可用 recipe.key_ref 复用，不自动展开密钥字节。") : null,
             action === "infer" ? el("p", { className: "ig5-card-sub" }, "推导消息边界、长度字段、端序与字段候选；未知流起点保留不确定性。独立 holdout_samples 用于验证，不能用训练样本自证。候选 framing／schema 可复制到 decode，decodeInput 的 startOffset／byteLength 对应 offset／length；原始前缀与尾部保留在来源引用。字段含义与状态机仍需人工确认。") : null,
+            action === "state_infer" || action === "state_validate" ? el("p", { className: "ig5-card-sub" }, "输入为明确会话边界的方向／符号轨迹 JSON，可由 ig5_capture state_trace 导出。state_infer 构建观察模型与可选合并假设；state_validate 需要已保存的 state_model.result_id 和新轨迹。接受、拒绝只针对该模型，未观测的服务器状态保持未知。") : null,
             el("textarea", { className: "ig5-textarea ig5-mono", "aria-label": "分析附加参数 JSON", value: parameters, onChange: function (e) { setParameters(e.target.value); setDraft(""); }, placeholder: "recovery / recipe / expected，或 inference / schema / framing 的 JSON 参数" }),
             el("button", { className: "ig5-btn", onClick: function () { setParameters(JSON.stringify(analysisTemplate(lane, action), null, 2)); setDraft(""); setNotice("已填入可编辑参数模板，请核对数据边界与验证证据。"); } }, "填入分析参数模板"),
             el("button", { className: "ig5-btn ig5-btn-primary", onClick: createDraft }, "生成分析草稿"),
@@ -2086,8 +2313,22 @@
           if (typeof value.previewHex === "string") previews.push({ name: "输入", hex: value.previewHex });
           (value.frames || []).slice(0, 8).forEach(function (frame, index) { if (typeof frame.previewHex === "string") previews.push({ name: "帧 " + index + " · 偏移 " + (frame.offset || 0), hex: frame.previewHex }); });
           function hexRows(hex) { var bytes = (hex.slice(0, 512).match(/../g) || []), rows = []; for (var at = 0; at < bytes.length; at += 16) rows.push(at.toString(16).padStart(4, "0") + "  " + bytes.slice(at, at + 16).join(" ")); return rows.join("\n"); }
+          var state = value.state, stateSummary = null;
+          if (state && typeof state === "object" && !Array.isArray(state)) {
+            var stateText = function (item) { return typeof item === "string" ? item.slice(0, 256) : "未提供"; };
+            var stateCount = function (item) { return Number.isSafeInteger(item) && item >= 0 && !Object.is(item, -0) ? String(item) : "未提供"; };
+            var coverage = state.coverage || {}, holdout = state.holdout || {}, ambiguity = state.ambiguity || {};
+            stateSummary = el("section", { "aria-label": "协议状态结论摘要" },
+              el("p", null, "状态：" + stateText(state.status) + " · 方法：" + stateText(state.method)),
+              el("p", null, "训练轨迹：" + stateCount(coverage.trainingTraces) + " · 纳入：" + stateCount(coverage.includedTraces) + " · 排除：" + stateCount(coverage.excludedTraces) + " · 已观察事件：" + stateCount(coverage.observedEvents)),
+              el("p", null, "验证：接受 " + stateCount(holdout.accepted) + " · 拒绝 " + stateCount(holdout.rejected) + " · 未知 " + stateCount(holdout.unknown) + " · 模型：" + stateText(holdout.model)),
+              el("p", { className: "ig5-card-sub ig5-mono" }, "来源模型报告：" + stateText(state.sourceResultId) + " · 选定模型：" + stateText(state.selectedModel)),
+              el("p", { className: "ig5-card-sub" }, "合并假设：" + (ambiguity.mergeHypothesis === true ? "有" : ambiguity.mergeHypothesis === false ? "无" : "未提供") + "。接受／拒绝只针对观察模型，未知项仍需补充证据；不能据此还原隐藏服务器状态或证明协议完整。"),
+              report.responseTruncated === true ? el("p", { className: "ig5-card-sub" }, "当前报告预览已截断；缺失字段显示为未提供，请按报告 ID 读取完整字段。") : null);
+          }
           return el("div", { className: "ig5-card" },
-            el("div", { className: "ig5-card-title-text" }, "候选、验证与字节证据"),
+            el("div", { className: "ig5-card-title-text" }, stateSummary ? "协议状态观察与验证" : "候选、验证与字节证据"),
+            stateSummary,
             inference && inference.coverage ? el("p", { className: "ig5-card-sub", role: "status" }, "分析覆盖: " + inference.coverage.status + " · 已分析 " + inference.coverage.analyzedGroups + " / " + inference.coverage.eligibleGroups + " 组 · 跳过 " + inference.coverage.skippedGroups + (inference.coverage.previewTruncated ? " · 预览另有省略" : "")) : null,
             candidates.length ? el("div", { style: { overflowX: "auto" } }, el("table", { className: "ig5-table" },
               el("thead", null, el("tr", null, ["候选", "评分", "验证", "复用"].map(function (label) { return el("th", { key: label }, label); }))),
@@ -2258,12 +2499,12 @@
             "ig5_doctor", "ig5_open", "ig5_status", "ig5_funcs", "ig5_strings",
             "ig5_decompile", "ig5_xrefs", "ig5_calls", "ig5_bytes", "ig5_search",
             "ig5_listing", "ig5_scan", "ig5_export_diff", "ig5_cfg", "ig5_slice", "ig5_fingerprint",
-            "ig5_stack", "ig5_switches", "ig5_vtables", "ig5_microcode", "ig5_bindiff", "ig5_ir", "ig5_crypto", "ig5_protocol"
+            "ig5_stack", "ig5_switches", "ig5_vtables", "ig5_microcode", "ig5_bindiff", "ig5_ir", "ig5_crypto", "ig5_protocol", "ig5_capture"
           ];
           var writeTools = [
             "ig5_rename", "ig5_patch_bytes", "ig5_comment", "ig5_analyze",
             "ig5_set_type", "ig5_undo", "ig5_run_idapython", "ig5_dbg", "ig5_struct",
-            "ig5_switch_repair", "ig5_emulate", "ig5_sync"
+            "ig5_switch_repair", "ig5_emulate", "ig5_sync", "ig5_capture_control"
           ];
           var metaTools = ["ig5_close", "ig5_profile"];
           var totalTools = readTools.length + writeTools.length + metaTools.length;
@@ -2442,6 +2683,10 @@
         exports.__test.readData = readData;
         exports.__test.captureReadSnapshot = captureReadSnapshot;
         exports.__test.ToolsMatrixView = Ig5ToolsMatrixView;
+        exports.__test.CaptureView = Ig5CaptureView;
+        exports.__test.CaptureMessage = CaptureMessage;
+        exports.__test.buildCaptureDraft = buildCaptureDraft;
+        exports.__test.capturePreview = capturePreview;
         return module.exports;
       },
     });

@@ -105,8 +105,8 @@ try {
     ...(process.env.IG5_IDA_DIR ? { idaDir: process.env.IG5_IDA_DIR } : {}),
     ...(process.env.IG5_PYTHON ? { pythonExe: process.env.IG5_PYTHON } : {}),
   });
-  await check('38 tools and real configured static engines are available', async () => {
-    assert.equal(tools.size, 38);
+  await check('40 tools and real configured static engines are available', async () => {
+    assert.equal(tools.size, 40);
     const profile = await call('ig5_profile');
     for (const id of ['reverse', 'ghidra']) assert.equal(profile.engines.find(row => row.id === id)?.available, true, `${id} actual runtime must be available`);
     const gate = events.get('tools/pre-execute');

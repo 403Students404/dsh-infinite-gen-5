@@ -1,5 +1,6 @@
 """Transport/state regressions with a fake debugger; never launches a target."""
 import importlib.util
+import io
 from pathlib import Path
 import struct
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "adapters/x64dbg/adapter.py"
 spec = importlib.util.spec_from_file_location("ig5_x64dbg_adapter", SOURCE)
@@ -48,6 +50,60 @@ class FakeClient:
 
 
 class AdapterTests(unittest.TestCase):
+    def test_explicit_exception_handling_is_bound_to_current_native_pause(self):
+        class Native(FakeClient, mod.NativeClient):
+            def close(self): pass
+        self.client = self.adapter.client = Native(self.adapter)
+        self.adapter.native_run_epoch = 1
+        self.adapter.state = lambda: {'state': 'suspended', 'stopSeq': self.adapter.stop_seq, 'runId': 'test-run', 'tid': 9, 'nativeRunEpoch': 1}
+        self.adapter.context = self.adapter.state
+        self.adapter.wait_state = lambda *args: {'ok': True, 'state': 'suspended'}
+        self.adapter.mode = 'headless'
+        pipe = io.BytesIO()
+        self.adapter.proc = SimpleNamespace(stdin=pipe, pid=123, poll=lambda: 0)
+        self.adapter.job = SimpleNamespace(handle=1, close=lambda: None)
+        self.adapter.check = lambda: None
+        with self.assertRaisesRegex(mod.RpcError, 'observed exception pause'):
+            self.dbg('cont', exception_disposition='handled')
+        self.assertEqual(self.client.commands, [])
+        self.adapter.record_event(SimpleNamespace(event_type='EVENT_EXCEPTION',
+            event_data={'ExceptionCode': 0x80000003, 'ExceptionAddress': 0x140001002, 'dwFirstChance': True},
+            native_stop_seq=1, native_run_epoch=1))
+        result = self.dbg('cont', exception_disposition='handled')
+        self.assertEqual(pipe.getvalue(), b'serun\n')
+        self.assertEqual(self.client.commands, [])
+        self.assertEqual(result['continuedException']['code'], '0x80000003')
+        self.assertEqual(result['continuedException']['stopSeq'], 1)
+        self.assertEqual(result['exceptionDisposition'], 'handled')
+        # A newer stop cannot consume the previous exception; neither can an
+        # exception from a stale run epoch that happens to share its stop number.
+        self.adapter.stop_seq = 3
+        with self.assertRaisesRegex(mod.RpcError, 'observed exception pause'):
+            self.dbg('cont', exception_disposition='handled')
+        self.adapter.record_event(SimpleNamespace(event_type='EVENT_EXCEPTION', event_data={}, native_stop_seq=3, native_run_epoch=2))
+        with self.assertRaisesRegex(mod.RpcError, 'observed exception pause'):
+            self.dbg('cont', exception_disposition='handled')
+        self.assertEqual(pipe.getvalue(), b'serun\n')
+        self.assertEqual(self.client.commands, [])
+
+    def test_debug_environment_parameters_refuse_before_side_effects(self):
+        for op, params in [('regs', {'anti_debug_profile': 'scyllahide-thread-context'}),
+            ('start', {'anti_debug_profile': 'arbitrary'}), ('step', {'exception_disposition': 'handled'}),
+            ('cont', {'exception_disposition': 'serun;arbitrary'}), ('start', {'anti_debug_profile': 'scyllahide-thread-context'})]:
+            with self.assertRaises(mod.RpcError): self.dbg(op, **params)
+        self.adapter.mode = 'headless'; self.adapter.config['bridge'] = 'ig5-native'
+        with patch.object(mod, 'inspect_pe', return_value={'bits': 32}):
+            with self.assertRaisesRegex(mod.RpcError, 'override must be x64'):
+                self.dbg('start', anti_debug_profile='scyllahide-thread-context', path='OWN-32-bit.exe')
+        self.assertEqual(self.client.commands, [])
+
+    def test_continuation_wait_does_not_raise_other_operation_budgets(self):
+        self.assertEqual(mod.Adapter.timeout_seconds({'op': 'cont', 'timeout': 120}), 120)
+        self.assertEqual(mod.Adapter.timeout_seconds({'op': 'cont', 'timeout': 121}), 120)
+        for operation in ('trace', 'step', 'start', 'regs'):
+            self.assertEqual(mod.Adapter.timeout_seconds({'op': operation, 'timeout': 120}), 60)
+        with self.assertRaisesRegex(ValueError, 'finite'): mod.Adapter.timeout_seconds({'op': 'cont', 'timeout': float('inf')})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ig5-x64dbg-fake-")
         self.adapter = mod.Adapter(Path(self.temp.name) / "runtime.json")
@@ -83,6 +139,10 @@ class AdapterTests(unittest.TestCase):
     def test_native_thread_stack_and_hardware_contract(self):
         class FakeNative(FakeClient, mod.NativeClient):
             def close(self): pass
+            def drain(self): pass
+            def request(self, method, **params):
+                if method != 'state': raise AssertionError('Unexpected native snapshot method')
+                return {'debugging': self.debugging, 'running': self.running, 'pid': 7, 'tid': 9}
             def module_info(self, ea): return {"found": True, "base": "0x140000000", "size": 0x4000, "name": "fake.exe", "path": "fake.exe"}
             def get_threads(self): return {"threads": [{"threadId": 9, "current": True}], "total": 1, "truncated": False}
             def get_callstack(self): return {"frames": [{"index": 0, "from": "0x140001000"}], "threadId": 9, "heuristic": True}
@@ -100,6 +160,17 @@ class AdapterTests(unittest.TestCase):
         for op in ("threads", "callstack"):
             with self.assertRaises(mod.RpcError) as error: self.dbg(op)
             self.assertEqual(error.exception.code, "ESTATE")
+
+    def test_native_idle_running_hint_never_implies_an_active_debuggee(self):
+        class IdleNative(FakeClient, mod.NativeClient):
+            def drain(self): pass
+            def close(self): pass
+            def request(self, method, **params):
+                self.asserted_method = method
+                return {'debugging': False, 'running': True, 'pid': 0, 'tid': 0}
+        self.adapter.client = IdleNative(self.adapter)
+        self.assertEqual(self.adapter.state()['state'], 'no-task')
+        self.assertEqual(self.adapter.client.asserted_method, 'state')
 
     def test_hardware_rejects_before_native_side_effect(self):
         for params in ({"kind": "hardware", "access": "execute", "size": 4},
@@ -457,6 +528,55 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["eventName"], "step")
         self.assertNotIn("exception", result["context"])
+
+    def test_recording_fast_wait_requires_pause_then_step_in_same_epoch(self):
+        class RecordingNative(FakeClient, mod.NativeClient):
+            def close(self): pass
+            def drain(self): pass
+            def request(self, method, **params):
+                return {'debugging': True, 'running': False, 'pid': 7, 'tid': 9}
+        self.adapter.client = RecordingNative(self.adapter)
+        original = self.adapter.state
+        polls = []
+        def state():
+            polls.append(1)
+            typ = 'EVENT_PAUSE_DEBUG' if len(polls) == 1 else 'EVENT_STEPPED'
+            self.adapter.record_event(SimpleNamespace(event_type=typ, event_data={}))
+            return original()
+        self.adapter.state = state
+        result = self.adapter.wait_state(0, recording=True)
+        self.assertEqual(result['eventName'], 'step')
+        self.assertGreaterEqual(len(polls), 2)
+        self.assertEqual(result['stopSeq'], 1)
+
+    def test_recording_fast_wait_refuses_pause_without_step(self):
+        class RecordingNative(FakeClient, mod.NativeClient):
+            def close(self): pass
+            def drain(self): pass
+            def request(self, method, **params):
+                return {'debugging': True, 'running': False, 'pid': 7, 'tid': 9}
+        self.adapter.client = RecordingNative(self.adapter)
+        self.adapter.record_event(SimpleNamespace(event_type='EVENT_PAUSE_DEBUG', event_data={}))
+        self.adapter.deadline = time.monotonic() + 0.02
+        with self.assertRaises(mod.RpcError) as error: self.adapter.wait_state(0, recording=True)
+        self.assertEqual(error.exception.code, 'ETIMEDOUT')
+
+    def test_native_resume_callback_after_completed_step_is_not_a_new_run(self):
+        class RecordingNative(FakeClient, mod.NativeClient):
+            def close(self): pass
+            def drain(self): pass
+            def request(self, method, **params): return {'debugging': True, 'running': False, 'pid': 7, 'tid': 9}
+        self.adapter.client = RecordingNative(self.adapter)
+        for typ in ['EVENT_PAUSE_DEBUG', 'EVENT_STEPPED', 'EVENT_RESUME_DEBUG']:
+            self.adapter.record_event(SimpleNamespace(event_type=typ, event_data={}))
+        result = self.adapter.wait_state(0, recording=True, recording_start_stop=0)
+        self.assertTrue(result['ok']); self.assertEqual(result['eventName'], 'step')
+        self.assertTrue(result['lateResumeObserved']); self.assertEqual(result['stopSeq'], 1)
+
+    def test_recording_soft_event_deadline_keeps_state_and_never_claims_step(self):
+        result = self.adapter.wait_state(0, recording=True, recording_deadline=time.monotonic() - 1)
+        self.assertFalse(result['ok']); self.assertFalse(result['stepConfirmed'])
+        self.assertTrue(result['recordingWaitExpired']); self.assertIs(self.adapter.client, self.client)
 
 
 if __name__ == "__main__": unittest.main(verbosity=2)

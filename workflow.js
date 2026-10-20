@@ -6,6 +6,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_NAMES = Object.freeze([
   'ig5-triage', 'ig5-deep-dive', 'ig5-patch-and-sign', 'ig5-diff', 'ig5-debug-live',
   'ig5-crypto', 'ig5-protocol',
+  'ig5-reverse-agent',
 ]);
 
 /** The eight schemas advertised by the core toolset. Full uses all supplied definitions. */
@@ -168,14 +169,15 @@ export function installWorkflow(ctx, { cfg, mgr, definitions, formatError = (err
     const explicit = pathInput(input);
     if (explicit) return explicit;
     const sessions = [...mgr.sessions.values()].filter((session) => mgr.alive(session) && session.engine !== 'x64dbg' && (!engine || session.engine === engine));
-    if (sessions.length !== 1) throw new Error(sessions.length ? '当前有多个目标，请在 export 后指定路径' : '当前没有打开的目标');
+    if (sessions.length !== 1) throw new Error(sessions.length ? '当前有多个目标，请在命令中指定路径' : '当前没有打开的目标');
     return sessions[0].target;
   }
 
   async function readCommandTool(name, args, invocation) {
     // Only these read operations may bypass model execution; no write tool is
     // reachable from this command. Writes remain on the host approval pipeline.
-    if (!['ig5_status', 'ig5_open', 'ig5_export_diff', 'ig5_profile'].includes(name)) throw new Error('Command only supports IG5 read operations');
+    if (!['ig5_status', 'ig5_open', 'ig5_export_diff', 'ig5_profile', 'ig5_microcode', 'ig5_protocol'].includes(name)) throw new Error('Command only supports IG5 read operations');
+    if (name === 'ig5_microcode' && args.action !== 'deobfuscate' || name === 'ig5_protocol' && !['state_infer', 'state_validate'].includes(args.action)) throw new Error('Command only supports the selected read-only analysis action');
     if (invocation.signal?.aborted) throw new Error('IG5 命令已取消');
     const definition = catalog.get(name);
     if (!definition) throw new Error(`IG5 tool is unavailable: ${name}`);
@@ -184,8 +186,8 @@ export function installWorkflow(ctx, { cfg, mgr, definitions, formatError = (err
 
   const command = {
     name: 'ig5',
-    description: '统一逆向工作流：引擎自检信息、状态、打开样本、导出补丁副本、切换 Core8/Full 工具面。',
-    input: { hint: 'status | engines | open [--engine reverse|ghidra] <path> | export [--engine reverse|ghidra] [path] | toolset [core|full]' },
+    description: '统一逆向工作流：引擎信息、打开样本、只读去混淆、协议状态建模与验证、导出副本、切换 Core8/Full 工具面。',
+    input: { hint: 'status | engines | open [--engine reverse|ghidra] <path> | deobfuscate [--engine reverse|ghidra] <ea> [path] | state <trace.json> | state-validate <report UUID> <trace.json> | export [path] | toolset [core|full]' },
     async handler(invocation) {
       try {
         if (disposed) throw new Error('IG5 workflow has been disposed');
@@ -206,9 +208,20 @@ export function installWorkflow(ctx, { cfg, mgr, definitions, formatError = (err
           result = await readCommandTool('ig5_open', { path: target, ...(engine ? { engine } : {}) }, invocation);
         } else if (action === 'export') {
           result = await readCommandTool('ig5_export_diff', { target: selectedTarget(input, engine), ...(engine ? { engine } : {}) }, invocation);
+        } else if (action === 'deobfuscate') {
+          const selected = /^(0x[0-9a-f]+)(?:\s+([\s\S]+))?$/i.exec(input);
+          if (!selected) throw new Error('用法：/ig5 deobfuscate [--engine reverse|ghidra] <十六进制函数地址> [样本完整路径]');
+          result = await readCommandTool('ig5_microcode', { action: 'deobfuscate', ea: selected[1], target: selectedTarget(selected[2] || '', engine), ...(engine ? { engine } : {}) }, invocation);
+        } else if (action === 'state' || action === 'state-validate') {
+          if (engine) throw new Error('协议状态分析不使用静态引擎参数');
+          const selected = action === 'state-validate' ? /^([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\s+([\s\S]+)$/.exec(input) : null;
+          const filename = pathInput(action === 'state' ? input : selected?.[2] || '');
+          if (!filename) throw new Error('用法：/ig5 state <轨迹JSON完整路径> 或 /ig5 state-validate <推断报告UUID> <新轨迹JSON完整路径>');
+          result = await readCommandTool('ig5_protocol', { action: action === 'state' ? 'state_infer' : 'state_validate', input: { path: filename },
+            state_model: action === 'state' ? { merge: 'future-equivalent', merge_depth: 2 } : { result_id: selected[1], model: 'prefix-tree' } }, invocation);
         } else if (action === 'toolset') {
           result = input ? setToolset(input.toLowerCase(), invocation) : snapshot(invocation);
-        } else throw new Error('用法：/ig5 status | open <path> | export [path] | toolset [core|full]');
+        } else throw new Error('用法：/ig5 status | open <path> | deobfuscate <ea> [path] | state <trace.json> | state-validate <report UUID> <trace.json> | export [path] | toolset [core|full]');
         return { kind: 'success', text: JSON.stringify(result, null, 2) };
       } catch (error) {
         return { kind: 'error', text: formatError(error, cfg) };

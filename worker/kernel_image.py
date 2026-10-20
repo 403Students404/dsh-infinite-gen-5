@@ -114,7 +114,7 @@ class BinaryImage:
     on open. Every read has the same byte budget as the input file by default.
     """
     @classmethod
-    def from_file(cls, path, max_bytes=DEFAULT_MAX_BYTES):
+    def from_file(cls, path, max_bytes=DEFAULT_MAX_BYTES, *, elf_sections='strict'):
         budget = cls._budget(max_bytes)
         flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0)
         fd = os.open(os.fspath(path), flags)
@@ -138,7 +138,7 @@ class BinaryImage:
                 raise ImageFormatError('binary input changed during read')
         finally:
             os.close(fd)
-        return cls.from_bytes(b''.join(chunks), name=os.fspath(path), max_bytes=budget)
+        return cls.from_bytes(b''.join(chunks), name=os.fspath(path), max_bytes=budget, elf_sections=elf_sections)
 
     @staticmethod
     def _budget(value):
@@ -148,13 +148,15 @@ class BinaryImage:
         return value
 
     @classmethod
-    def from_bytes(cls, data, name='<memory>', max_bytes=DEFAULT_MAX_BYTES):
+    def from_bytes(cls, data, name='<memory>', max_bytes=DEFAULT_MAX_BYTES, *, elf_sections='strict'):
         budget = cls._budget(max_bytes)
         if not isinstance(data, bytes):
             raise ImageFormatError('binary input must be immutable bytes')
         if len(data) > budget:
             raise ImageFormatError('binary input exceeds its byte budget')
         self = cls.__new__(cls)
+        if elf_sections not in ('strict', 'program-headers'): raise ImageFormatError('invalid ELF section validation policy')
+        self.elf_section_policy = elf_sections
         self.path, self._blob, self.max_bytes = str(name), data, budget
         self.sha256 = hashlib.sha256(data).hexdigest()
         self.sections, self.segments, self.data_directories = (), (), ()
@@ -450,6 +452,13 @@ class BinaryImage:
         self.imagebase = min(r.start for r in regions)
         self.entrypoint = entry if entry else None
         self.segments = tuple(segments)
+        # Runtime traces bind bytes to PT_LOAD, which is the ELF loader's source
+        # of mappings. Packed binaries can retain misleading section metadata.
+        # This explicit mode still validates all program mappings and boundaries;
+        # static kernel clients retain strict section validation by default.
+        if self.elf_section_policy == 'program-headers':
+            self.sections = ()
+            return
         raw_sections = [self._unpack(section_fmt, shoff + i * sh_size, 'ELF section header')
                         for i in range(shnum)]
         if raw_sections and raw_sections[0][1] != 0:

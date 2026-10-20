@@ -584,6 +584,116 @@ test('Ghidra IR selection requests explicit level and keeps source distinct', as
   assert.match(text(h.tree), /不对应 Reverse/); assert.match(text(h.tree), /COPY r0/); h.unmount();
 });
 
+test('deobfuscation view requests only the read-only overlay and rejects a late result after function selection changes', async () => {
+  const urls = [], pending = [];
+  request = url => { urls.push(url); const query = new URL(url, 'http://test').searchParams;
+    return query.get('action') === 'deobfuscate' ? new Promise(resolve => pending.push(resolve)) : Promise.resolve(response({ kind: 'pcode' })); };
+  const h = harness(ui.IrView, { target: 'a.exe', engine: 'ghidra', ea: '0x1000' }); h.render(); await settle(); h.render();
+  nodes(h.tree, node => node.type === 'select')[0].props.onChange({ target: { value: 'deobfuscate' } }); h.render();
+  const query = new URL(urls.at(-1), 'http://test').searchParams;
+  assert.equal(query.get('type'), 'microcode'); assert.equal(query.get('action'), 'deobfuscate'); assert.equal(query.get('max_steps'), '100000');
+  assert.equal(query.has('rules'), false); assert.match(text(h.tree), /不修改程序/);
+  h.render({ ...h.props, ea: '0x2000' });
+  pending[0](response({ deobfuscation: { algorithm: 'OLD_SUMMARY_ONLY', constants: ['OLD_FUNCTION_ONLY'] } })); await settle(); h.render();
+  assert(!text(h.tree).includes('OLD_FUNCTION_ONLY'));
+  assert(!text(h.tree).includes('OLD_SUMMARY_ONLY'));
+  pending[1](response({ deobfuscation: { constants: ['NEW_FUNCTION_ONLY'] } })); await settle(); h.render();
+  assert.match(text(h.tree), /NEW_FUNCTION_ONLY/);
+  h.render({ ...h.props, ea: '0x3000' });
+  assert.equal(nodes(h.tree, node => node.props['aria-label'] === '去混淆结论摘要').length, 0);
+  h.unmount();
+});
+
+test('IR ignores polling telemetry but immediately invalidates on every evidence identity change', async () => {
+  const urls = [];
+  request = url => { urls.push(url); const snapshot = JSON.parse(new URL(url, 'http://test').searchParams.get('expected_snapshot')); return Promise.resolve(scopedResponse(snapshot, { deobfuscation: { algorithm: 'BOUND_RESULT' } })); };
+  let session = { ...mountedSession, key: 'session-1', uptimeMs: 10, lastOp: 'status', progress: 50 };
+  const h = harness(ui.IrView, { target: session.target, engine: session.engine, ea: '0x1000', session });
+  h.render(); await settle(); h.render();
+  control(h.tree, 'p-code 层级').props.onChange({ target: { value: 'deobfuscate' } }); h.render(); await settle(); h.render();
+  assert.equal(urls.length, 2); assert.match(text(h.tree), /BOUND_RESULT/);
+  for (let tick = 1; tick <= 3; tick++) {
+    session = { ...session, uptimeMs: 1000 * tick, lastOp: 'microcode', progress: tick };
+    h.render({ ...h.props, session }); await settle(); h.render();
+    assert.equal(urls.length, 2); assert.match(text(h.tree), /BOUND_RESULT/);
+  }
+  for (const field of ['key', 'target', 'engine', 'projectId', 'artifactId', 'sha256', 'provider', 'attachmentId', 'dbRevision']) {
+    const before = urls.length;
+    session = { ...session, [field]: field === 'dbRevision' ? session[field] + 1 : session[field] + '-changed' };
+    h.render({ ...h.props, session });
+    assert.doesNotMatch(text(h.tree), /BOUND_RESULT/);
+    assert.equal(urls.length, before + 1);
+    await settle(); h.render(); assert.match(text(h.tree), /BOUND_RESULT/);
+  }
+  h.unmount();
+});
+
+test('deobfuscation evidence summary precedes huge raw graphs and bounds escaped branch and route previews', async () => {
+  const urls = [], evidence = { algorithm: 'sccp-bitvector-v1', partial: false, evidenceTruncated: true,
+    branchDecisions: Array.from({ length: 9 }, (_, index) => ({ block: index, ea: '0x1000', condition: '0x0', destination: 20, discarded: [21] })),
+    unreachableBlocks: [21], unresolved: [{ opcode: 'LOAD' }], expressionSimplifications: [{ replacement: { opcode: 'INT_XOR' } }], indirectTransfers: [{ targetsResolved: false }],
+    dispatcherRoutes: Array.from({ length: 9 }, (_, index) => ({ predecessor: index, dispatcher: 30, destination: 31, pathTruncated: true,
+      path: [{ block: 30, destination: 31, condition: '<script>unsafe</script>' }], stateEvidence: [{ ssa: 4, width: 32, value: '0x2' }], stateEvidenceTruncated: true })) };
+  request = (url, options) => { urls.push(url); assert.equal(options, undefined); return Promise.resolve(response({ blocks: ['GRAPH_FIRST', 'x'.repeat(65000)], deobfuscation: evidence })); };
+  const h = harness(ui.IrView, { target: 'a.exe', engine: 'ghidra', ea: '0x1000' }); h.render(); await settle(); h.render();
+  control(h.tree, 'p-code 层级').props.onChange({ target: { value: 'deobfuscate' } }); h.render(); await settle(); h.render();
+  const summary = nodes(h.tree, node => node.props['aria-label'] === '去混淆结论摘要')[0];
+  assert(summary); assert.match(text(summary), /已返回分支证明：9 · 不可达块：1 · 分发器路径：9 · 未决项：1/);
+  assert.match(text(summary), /局部表达式化简：1 · 间接目标依赖切片：1/);
+  assert.match(text(summary), /证据截断：是/); assert.match(text(summary), /块 0 @ 0x1000/); assert.match(text(summary), /入口 0 → 分发器 30 → 目标 31/);
+  assert.match(text(summary), /SSA 4 = 0x2 \/ 32 位/); assert.match(text(summary), /路径已截断/); assert.match(text(summary), /赋值已截断/);
+  assert.match(text(summary), /前 8 条/); assert(!text(summary).includes('块 8 @')); assert(!text(summary).includes('入口 8 →'));
+  assert(markup(summary).includes('&lt;script&gt;')); assert(!markup(summary).includes('<script>'));
+  assert(text(h.tree).indexOf('去混淆结论') < text(h.tree).indexOf('GRAPH_FIRST'));
+  assert.equal(text(nodes(h.tree, node => node.props['aria-label'] === 'IR 原始结果')[0]).length, 64000);
+  assert.equal(urls.length, 2); h.unmount();
+});
+
+test('deobfuscation summary distinguishes missing counts from explicit empty evidence and partial results', async () => {
+  request = () => Promise.resolve(response({ deobfuscation: { partial: true, branchDecisions: [], evidenceTruncated: false } }));
+  const h = harness(ui.IrView, { target: 'a.exe', engine: 'ghidra', ea: '0x1000' }); h.render(); await settle(); h.render();
+  control(h.tree, 'p-code 层级').props.onChange({ target: { value: 'deobfuscate' } }); h.render(); await settle(); h.render();
+  const summary = nodes(h.tree, node => node.props['aria-label'] === '去混淆结论摘要')[0];
+  assert.match(text(summary), /算法：未提供/); assert.match(text(summary), /分析范围：不完整/);
+  assert.match(text(summary), /已返回分支证明：0 · 不可达块：未提供 · 分发器路径：未提供 · 未决项：未提供/);
+  assert.match(text(summary), /返回 0 条不代表不存在/); h.unmount();
+});
+
+test('protocol state report summarizes real coverage and validation without invented counts or execution', () => {
+  request = () => assert.fail('state summary must not request data or execute tools');
+  const report = { id: 'validation-report', value: { state: { status: 'bounded-observation-model', method: 'bounded-future-equivalence-replay',
+    coverage: { trainingTraces: 4, includedTraces: 3, excludedTraces: 1, observedEvents: 12 },
+    holdout: { accepted: 2, rejected: 1, unknown: 3, model: 'merged-hypothesis' }, sourceResultId: '<script>producer</script>', selectedModel: 'merged-hypothesis', ambiguity: { mergeHypothesis: true } } } };
+  const h = harness(ui.AnalysisEvidence, { report }); h.render();
+  const summary = nodes(h.tree, node => node.props['aria-label'] === '协议状态结论摘要')[0];
+  assert.match(text(summary), /训练轨迹：4 · 纳入：3 · 排除：1 · 已观察事件：12/);
+  assert.match(text(summary), /验证：接受 2 · 拒绝 1 · 未知 3 · 模型：merged-hypothesis/);
+  assert.match(text(summary), /来源模型报告：<script>producer<\/script> · 选定模型：merged-hypothesis/);
+  assert.match(text(summary), /合并假设：有/); assert.match(text(summary), /不能据此还原隐藏服务器状态/);
+  assert(markup(summary).includes('&lt;script&gt;')); assert(!markup(summary).includes('<script>'));
+  h.render({ report: { id: 'partial-report', responseTruncated: true, value: { state: { coverage: { trainingTraces: 0 }, holdout: {} } } } });
+  assert.match(text(h.tree), /训练轨迹：0 · 纳入：未提供/); assert.match(text(h.tree), /验证：接受 未提供 · 拒绝 未提供 · 未知 未提供/);
+  assert.match(text(h.tree), /当前报告预览已截断/); assert(!text(h.tree).includes('producer')); h.unmount();
+});
+
+test('protocol state drafts preserve model producer and explicit bounded inference without executing', () => {
+  const input = { ref: 'sha256:' + 'a'.repeat(64), result_id: '11111111-2222-3333-4444-555555555555' };
+  request = () => assert.fail('state draft must not make requests');
+  const h = harness(ui.AnalysisDraft, {}); h.render();
+  control(h.tree, '数据分析领域').props.onChange({ target: { value: 'protocol' } }); h.render();
+  control(h.tree, '数据分析操作').props.onChange({ target: { value: 'state_infer' } }); h.render();
+  button(h.tree, '填入分析参数模板').props.onClick(); h.render();
+  const options = JSON.parse(control(h.tree, '分析附加参数 JSON').props.value);
+  assert.equal(options.state_model.merge, 'future-equivalent');
+  assert.equal(options.state_model.max_events, 4096);
+  const inference = ui.buildAnalysisDraft('protocol', 'state_infer', input, JSON.stringify(options));
+  assert.equal(JSON.parse(inference.slice(inference.indexOf('{'))).action, 'state_infer');
+  const validation = ui.buildAnalysisDraft('protocol', 'state_validate', input, JSON.stringify({ state_model: { result_id: '22222222-2222-3333-4444-555555555555', model: 'prefix-tree' } }));
+  const value = JSON.parse(validation.slice(validation.indexOf('{')));
+  assert.equal(value.input.result_id, input.result_id); assert.equal(value.state_model.result_id, '22222222-2222-3333-4444-555555555555');
+  h.unmount();
+});
+
 test('bundled Reverse exposes p-code using the Reverse session route and actual Ghidra provider', async () => {
   const session = { ...mountedSession, target: 'a.exe' };
   request = url => {

@@ -17,7 +17,13 @@ export function defineAdvancedTools(mgr, cfg, render) {
       name, description,
       parameters: { type: 'object', properties: { target: targetProperty, ...properties }, required, additionalProperties: false },
       output: { schema: { type: 'object', additionalProperties: true }, render },
-      execute(args = {}) { return mgr.rpc(session(args), method, args, cfg.requestTimeoutMs); },
+      execute(args = {}) {
+        const selected = session(args);
+        if (name === 'ig5_microcode' && args.action === 'deobfuscate' && selected.engine !== 'ghidra' && !(selected.engine === 'reverse' && cfg.reverseProvider !== 'commercial')) {
+          throw new Error('deobfuscate requires the bundled Reverse or Ghidra provider');
+        }
+        return mgr.rpc(selected, method, args, cfg.requestTimeoutMs);
+      },
     };
   }
   return [
@@ -33,9 +39,12 @@ export function defineAdvancedTools(mgr, cfg, render) {
     rpcTool('ig5_vtables', 'vtables', 'Inspect MSVC and Itanium virtual tables, RTTI class names and inheritance evidence. Returns virtual slots and a reviewable structure declaration. Given a table EA and byte offset, resolve that explicit virtual slot; register provenance is not inferred.',
       { ea, abi: { type: 'string', enum: ['auto', 'msvc', 'itanium'] }, offset: { type: 'number' },
         max_slots: { type: 'number' }, limit: { type: 'number' }, max_scan_bytes: { type: 'number' }, max_bases: { type: 'number' } }),
-    rpcTool('ig5_microcode', 'microcode', 'Inspect real intermediate operations and CFG, or apply restricted xor-self/sub-self rules to a temporary IR. The bundled core uses Ghidra p-code with explicit actualStage/maturity mapping; those stages are not proprietary microcode equivalents. Returns before/after evidence and actual rule hits. Does not persist IR edits or automatically remove control-flow flattening.',
-      { ea, name, action: { type: 'string', enum: ['inspect', 'optimize'] }, maturity: { type: 'string', enum: ['generated', 'preoptimized', 'locopt', 'calls', 'glbopt1', 'glbopt2', 'glbopt3', 'lvars'], description: 'Legacy compatibility label. The bundled Ghidra provider maps labels to firstpass, normalize or decompile; inspect actualStage and maturityMapping. These are not equivalent proprietary maturity stages.' },
-        max_blocks: { type: 'number' }, max_instructions: { type: 'number' }, rules: { type: 'array', items: { type: 'string', enum: ['xor-self', 'sub-self'] } } }),
+    rpcTool('ig5_microcode', 'microcode', 'Inspect native IR/CFG or optimize temporary IR. action=deobfuscate on bundled Reverse/Ghidra performs bounded SSA constants, opaque-predicate proofs, branch and dispatcher evidence, exact local bitwise/linear MBA expression identities, and backward dependency slices for indirect targets. expressionSimplifications prove only local typed expressions; indirectTransfers do not resolve targets or VM handlers. Memory/calls/indirect control remain unresolved. Returns a read-only overlay without rewriting or executing the target. Ghidra actualStage/maturity mapping is explicit; no universal devirtualization or proprietary-stage equivalence claim.',
+      { ea, name, action: { type: 'string', enum: ['inspect', 'optimize', 'deobfuscate'] }, maturity: { type: 'string', enum: ['generated', 'preoptimized', 'locopt', 'calls', 'glbopt1', 'glbopt2', 'glbopt3', 'lvars'], description: 'Legacy compatibility label. Ghidra maps to firstpass, normalize or decompile. Deobfuscate defaults to generated/firstpass native SSA; inspect defaults to glbopt3/decompile. Inspect actualStage; stages are not proprietary equivalents.' },
+        max_blocks: { type: 'number' }, max_instructions: { type: 'number' },
+        max_steps: { type: 'integer', minimum: 1, maximum: 250000, description: 'Deobfuscation work budget, default 100000; unfinished proofs are withheld.' },
+        max_evidence: { type: 'integer', minimum: 1, maximum: 512, description: 'Maximum entries per deobfuscation evidence category, default 128.' },
+        rules: { type: 'array', items: { type: 'string', enum: ['xor-self', 'sub-self'] } } }),
     {
       name: 'ig5_bindiff',
       description: 'Compare two opened binary versions by normalized instructions, CFG neighborhoods, constants and call degree. Return scored function matches and changed basic blocks with ambiguity/truncation evidence. Heuristic patch candidates, not a claim of vulnerability or semantic equivalence. Read-only.',

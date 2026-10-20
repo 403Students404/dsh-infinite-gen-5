@@ -9,6 +9,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { AnalysisArtifacts } from '../source/analysis_artifacts.js';
 import { InvestigationStore } from '../source/investigation_store.js';
 import { runWorkspace, captureDossier } from '../source/investigation_workflow.js';
+import { DelegationControl } from '../source/delegation_control.js';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const failure = (call, code) => assert.throws(call, error => error.code === code);
@@ -55,6 +56,62 @@ function fixture(t) {
   const recordFiles = () => fs.readdirSync(path.join(artifacts.root, 'records')).filter(file => file.endsWith('.json'));
   return { root, cfg, context, session, execution, mgr, artifacts, workspace, create, capture, recordFiles };
 }
+
+test('handoff and cross-agent review bind task revisions and validate evidence without completing work', t => {
+  const f = fixture(t), task = f.create(), captured = f.capture(task.taskId);
+  const request = { action: 'handoff', id: task.taskId, expected_task_revision: 1,
+    question: 'Trace input to output', acceptance: 'Explain branches with dossier evidence', constraints: 'Read only; return candidates' };
+  const packet = f.workspace(request);
+  assert.equal(packet.kind, 'investigation-handoff');
+  assert.equal(packet.context.sha256, f.context.sha256);
+  assert.equal(packet.reportsVerified, false);
+  assert.equal(packet.contract.enforced, false);
+  assert.equal(packet.evidence[0].snapshot_id, captured.snapshotId);
+  failure(() => f.workspace({ ...request, expected_task_revision: 0 }), 'STALE_TASK_REVISION');
+  failure(() => f.workspace({ ...request, acceptance: '' }), 'INVALID_ARGUMENT');
+  const review = { action: 'review', id: task.taskId, expected_task_revision: 1, snapshot_ids: [captured.snapshotId] };
+  const checked = f.workspace(review, { agent: { id: 'reviewer' } });
+  assert.equal(checked.reportsVerified, true);
+  assert.equal(checked.semanticAcceptanceVerified, false);
+  assert.equal(checked.evidence[0].analysis.partial, true);
+  assert.equal(checked.staleEvidence, false);
+  assert.equal(f.workspace({ action: 'get', id: task.taskId }).status, 'active');
+  assert.equal(f.workspace({ action: 'get', id: task.taskId }).taskRevision, 1);
+  failure(() => f.workspace({ ...review, snapshot_ids: [randomUUID()] }), 'INVALID_REF');
+  failure(() => f.workspace({ ...review, snapshot_ids: [captured.snapshotId, captured.snapshotId] }), 'INVALID_ARGUMENT');
+  f.context.dbRevision++;
+  assert.equal(f.workspace(review).staleEvidence, true);
+  failure(() => f.workspace(review, {}), 'AGENT_SCOPE_REQUIRED');
+  const reportFile = path.join(f.artifacts.root, 'records', `${captured.reportId}.json`);
+  fs.appendFileSync(reportFile, ' ');
+  failure(() => f.workspace(review), 'ARTIFACT_CHANGED');
+});
+
+test('controlled workspace claim/read/submit/observed-return/review never upgrades semantic acceptance', t => {
+  const f = fixture(t);
+  const parent = { id: 'parent', session: { header: { id: 'parent' } } };
+  const child = { id: 'child', session: { header: { id: 'child', parentSession: 'parent' } } };
+  f.mgr.coordination = new DelegationControl({ root: f.cfg.projectRoot, getAgent: id => id === 'parent' ? parent : id === 'child' ? child : undefined });
+  const task = f.create(), captured = f.capture(task.taskId);
+  const common = { id: task.taskId, expected_task_revision: 1 };
+  const packet = f.workspace({ ...common, action: 'handoff', question: 'Input/output?', acceptance: 'Read dossier', constraints: 'Read only' }, { agent: parent });
+  assert.equal(packet.mode, 'tracked');
+  const review = { ...common, action: 'review', handoff_id: packet.handoffId, snapshot_ids: [captured.snapshotId] };
+  failure(() => f.workspace(review, { agent: parent }), 'CHILD_RETURN_REQUIRED');
+  const precheck = f.workspace({ ...review, handoff_id: undefined }, { agent: parent });
+  assert.equal(precheck.reviewStage, 'integrity-precheck'); assert.equal(precheck.delegationVerified, false);
+  f.mgr.coordination.start({ id: child.id, runId: 'run1', local: true });
+  f.workspace({ ...common, action: 'claim', handoff_id: packet.handoffId }, { agent: child });
+  failure(() => f.workspace({ ...review, action: 'submit' }, { agent: child }), 'EVIDENCE_READ_REQUIRED');
+  f.workspace({ action: 'evidence', id: task.taskId, snapshot_id: captured.snapshotId }, { agent: child });
+  f.workspace({ ...review, action: 'submit' }, { agent: child });
+  failure(() => f.workspace(review, { agent: parent }), 'CHILD_RETURN_REQUIRED');
+  f.mgr.coordination.end({ id: child.id, runId: 'run1', stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: 'snapshot returned' }] });
+  const result = f.workspace(review, { agent: parent });
+  assert.equal(result.reviewStage, 'post-return'); assert.equal(result.delegationVerified, true);
+  assert.equal(result.reportsVerified, true); assert.equal(result.semanticAcceptanceVerified, false);
+  assert.equal(f.workspace({ action: 'get', id: task.taskId }).taskRevision, 1);
+});
 
 test('workspace create/get/list/update preserves caller declarations and task CAS', t => {
   const f = fixture(t), created = f.create({ goal: '目标'.repeat(300) });

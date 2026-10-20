@@ -95,3 +95,25 @@ Reverse is an optional external commercial engine, not an IG5-developed or
 bundled engine. IG5 uses only the user's existing locally licensed installation;
 neither its binaries nor a license are included. DeepSeek Harness is separately
 installed and is not bundled either.
+
+The optional x64dbg/ScyllaHide sidecar is GPL-3.0, revision
+baa5c8e853ace2bee752631f27fdfe5b271d92f6. Corresponding locally modified
+sources and inventory: third_party/scyllahide. License: runtimes/scyllahide/LICENSE.
+Build and patch details: docs/SCYLLAHIDE.md and scripts/build_scyllahide.ps1.
+IG5's noncommercial terms do not apply to these third-party components.
+This product includes software developed by Gil Dabah (diStorm).
+diStorm 3.3.3 COPYING is retained in third_party/scyllahide-licenses.
+
+Triton offline trace semantics uses the separate pinned triton-library 1.0.0rc4
+Windows x64 CPython 3.12 wheel in worker/trace_vendor. Apache-2.0 and transitive
+solver/disassembler/runtime licenses, original wheel RECORD/DELVEWHEEL, source
+URLs and per-file inventory are retained there. No external VMP learning binary
+or upstream attack script is distributed. See docs/TRACE_RECOVERY.md for scope.
+
+The local experimental Mergen analysis subprocess is GPL-3.0-only, upstream
+NaC-L/Mergen revision 199805706ac00e156cc7e2a53ccc647c380f1786. The separate
+runtimes/mergen directory retains its license, IG5 patch, patched program and
+dependency source archive/inventory, LLVM license, and unmodified Microsoft
+CRT provenance. See docs/LIFTER.md. Full LLVM corresponding source/toolchain
+is not bundled and no new public release or complete offline rebuild claim is
+made. IG5's NC terms do not cover Mergen or its third-party dependencies.

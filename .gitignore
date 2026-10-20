@@ -8,4 +8,7 @@ Thumbs.db
 runtimes/
 third_party/*
 !third_party/x64dbg-build/
+!third_party/scyllahide-licenses/
 .downloads/
+/scratch/
+/adapters/vmci/native/*.obj

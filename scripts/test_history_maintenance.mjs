@@ -31,8 +31,11 @@ test('active/archive pages retain IDs, reports and reusable blob bytes after a s
     result: { action: 'inspect', output: { dataRef: { ...blob, producer: { resultId: 'fixture-producer' } } } } });
   const second = save(store, 'second');
   const foreign = save(store, 'foreign', { ...association, target: 'C:\\fixtures\\other.bin', engine: 'ghidra' });
-  const active = await store.list({ target: association.target.toUpperCase(), engine: 'reverse', limit: 100 });
+  const active = await store.list({ target: association.target, engine: 'reverse', limit: 100 });
   assert.equal(active.partial, false); assert.equal(active.total, 2); assert.deepEqual(new Set(active.items.map(item => item.id)), new Set([record.id, second.id]));
+  const changedCase = await store.list({ target: association.target.toUpperCase(), engine: 'reverse', limit: 100 });
+  assert.equal(changedCase.total, process.platform === 'win32' ? 2 : 0,
+    'target identity folds case only on Windows; POSIX targets remain case-sensitive');
   assert(active.items.every(item => !Object.hasOwn(item, 'recordSha256')));
   const archived = store.archive([record.id, second.id]); assert.equal(archived.ok, true); assert.equal(archived.retainedRecordsAndBlobs, true);
   assert.equal((await store.list()).total, 1); assert.equal((await store.list({ archived: true })).total, 2);

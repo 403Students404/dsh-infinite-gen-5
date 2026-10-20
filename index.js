@@ -11,19 +11,29 @@ import { spawnWorker, attachWorker, doctorWorker } from './source/worker_transpo
 import { ProjectStore } from './source/project_store.js';
 import { defineIntegrationTools } from './integration_tools.js';
 import { defineAnalysisTools } from './analysis_tools.js';
+import { defineCaptureTools } from './capture_tools.js';
 import { exportPatchDiff } from './source/patch_export.js';
 import { readAuditPage, targetIdentity } from './source/audit_history.js';
 import { jsonToolOutput } from './source/json_output.js';
 import { resolveReverseRuntime } from './source/reverse_runtime.js';
 import { collectFunctionDossier } from './source/function_dossier.js';
 import { workspaceSchema, runWorkspace, captureDossier } from './source/investigation_workflow.js';
+import { autonomyStatus } from './source/autonomy_status.js';
+import { recoveryProfileSchema, runRecoveryProfile } from './source/vm_recovery_profile.js';
+import { saveDebugTrace } from './source/debug_trace.js';
+import { debugTimeout } from './source/debug_timeout.js';
+import { RemoteExecutionStore, remoteExecutionKey } from './source/remote_execution_store.js';
+import { guestProfileConfiguration, loadGuestProfile, publicGuestProfile, guestTarget } from './source/guest_debug_profile.js';
+import { recoverGuestExecution, validateGuestRecoveryArgs } from './source/guest_recovery.js';
+import { ig5DashDefinition } from './source/dashboard_projection.js';
+import { installDelegationControl } from './source/delegation_control.js';
 
 // ── 无限五代（IG5）v1.0.0 ──────────────────────────────────────────────────
 // DeepSeek Harness 逆向插件：隔离多引擎 Worker 池 + ig5_* 工具面 + ig5dash 投影。
 // 零提示词注入；指导载体 = 工具描述 + 会话流卡片。
 
 const PLUGIN_ID = 'dsh-infinite-gen-5';
-const PLUGIN_VERSION = '1.0.0';
+const PLUGIN_VERSION = '1.1.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER = path.join(HERE, 'worker', 'ig5_worker.py');
 
@@ -59,6 +69,9 @@ function resolveConfig(cfg = {}) {
     autoOpenHint: cfg.autoOpenHint !== false,
     backgroundOpen: cfg.backgroundOpen !== false,
     toolset: cfg.toolset || 'core',
+    capture: cfg.capture ?? {},
+    guestDebugProfiles: guestProfileConfiguration(cfg.guestDebugProfiles),
+    remoteExecutionRoot: path.resolve(cfg.remoteExecutionRoot || path.join(runtime.home, 'remote-executions')),
   };
 }
 
@@ -97,7 +110,8 @@ class WorkerManager {
     this.debugQueues = new Map();
     this.admissions = Promise.resolve();
     // A lease is recoverable only after both recorded owners are proven dead.
-    this.attachmentRecovery = this.projects.recoverAttachments();
+    const retained = this.remoteExecutionStatus();
+    this.attachmentRecovery = this.projects.recoverAttachments({ retainDebugArtifacts: retained.map(row => 'artifact_' + row.targetSha256) });
   }
 
   sessionKey(target, engine = this.scope.getStore()?.engine || this.cfg.defaultEngine || 'reverse') {
@@ -125,6 +139,66 @@ class WorkerManager {
     if (this.scope.getStore()?.signal?.aborted) throw Object.assign(new Error('IG5 operation cancelled before execution'), { code: 'ABORT_ERR' });
   }
 
+  remoteStore() {
+    return this.guestExecutions ||= new RemoteExecutionStore({ root: this.cfg.remoteExecutionRoot || path.join(this.cfg.home || this.cfg.projectRoot, 'remote-executions') });
+  }
+
+  remoteExecutionStatus() {
+    const root = this.cfg.remoteExecutionRoot || path.join(this.cfg.home || this.cfg.projectRoot, 'remote-executions');
+    if (!this.guestExecutions && !fs.existsSync(path.join(root, 'projects.json'))) return [];
+    return this.remoteStore().list().filter(row => row.state !== 'cleaned').map(row => ({ key: row.key, nonce: row.nonce,
+      state: row.state, target: row.binding.target, targetSha256: row.binding.targetSha256, guestCID: row.binding.guestCID,
+      profile: row.binding.profileName, profileSha256: row.binding.profileSha256, remote: row.remote, agentId: row.agentId,
+      observedNativeRoots: row.observedRoots.length, scope: 'Retained guest execution custody; host/bridge liveness is not guest cleanup proof' }));
+  }
+
+  remoteCleanupEvidence() {
+    const root = this.cfg.remoteExecutionRoot || path.join(this.cfg.home || this.cfg.projectRoot, 'remote-executions');
+    if (!this.guestExecutions && !fs.existsSync(path.join(root, 'projects.json')))
+      return { entries: [], totalStoredCleanedGenerations: 0, omitted: 0, partial: false,
+        scope: 'No stored cleanup metadata; not proof of remote process termination' };
+    return this.remoteStore().cleanupEvidence();
+  }
+
+  retainRemoteExecution(session, reason = 'transport-lost') {
+    if (!session.remoteLease) return false;
+    const current = this.remoteStore().current(session.remoteLease.key);
+    if (current?.nonce === session.remoteLease.nonce && current.state === 'cleaned') return false;
+    session.ready = false;
+    session.runtime = { state: 'unknown', stateCode: null, guestExecutionRetained: true, cleanupRequired: true };
+    if (!current || current.nonce !== session.remoteLease.nonce) return true;
+    this.debugOwners.set(path.resolve(session.target).toLowerCase(), 'x64dbg');
+    if (current.state === 'reserved') {
+      const releaseUnarmed = () => {
+        try {
+          session.remoteLease = this.remoteStore().abandonUnarmed(current, true);
+          const currentSession = this.sessions.get(session.key);
+          if (currentSession === session) this.sessions.delete(session.key);
+          this.releaseAttachmentAfterExit(session);
+          if (!currentSession || currentSession === session) this.debugOwners.delete(path.resolve(session.target).toLowerCase());
+        } catch (error) { session.remoteLeaseError = publicEngineError(error, this.cfg); }
+      };
+      if (!session.proc?.pid || session.proc.exitCode !== null || session.proc.signalCode) releaseUnarmed();
+      else if (!session.remoteUnarmedExitWait) { session.remoteUnarmedExitWait = true; session.proc.once('exit', releaseUnarmed); }
+      return true;
+    }
+    session.remoteLease = this.remoteStore().uncertain(current, reason);
+    return true;
+  }
+
+  acceptRemoteResult(session, method, value) {
+    const location = value?.executionLocation, expected = session.executionLocation;
+    if (value?.authenticatedGuestResponse !== true || !location || !expected || ['kind', 'profileSha256', 'guestCID', 'bundleSha256', 'serverInstanceId', 'sessionId'].some(key => location[key] !== expected[key]))
+      throw new Error('Guest response identity differs from the bound worker');
+    const roots = value.guestProvenance?.nativeRootsObserved;
+    if (Array.isArray(roots) && roots.some(root => !session.remoteLease.observedRoots.some(known => known.rootId === root.rootId && known.pid === root.pid)))
+      session.remoteLease = this.remoteStore().observeRoots(session.remoteLease, roots);
+    if (value.guestCleanup !== undefined) {
+      if (method !== 'close' || value.guestCleanupHMACVerified !== true) throw new Error('Guest cleanup requires the authenticated terminal close response');
+      session.remoteLease = this.remoteStore().complete(session.remoteLease, value.guestCleanup);
+    }
+  }
+
   withSessions(sessions, perform) {
     const unique = [...new Set(sessions)].filter(Boolean);
     for (const session of unique) if (session.closing) throw new Error('Target is closing; wait for it to finish');
@@ -137,7 +211,7 @@ class WorkerManager {
     return pending;
   }
 
-  async admitSession(key, target, engine) {
+  async admitSession(key, target, engine, options = {}) {
     const pending = this.admissions.catch(() => {}).then(async () => {
       this.checkCancelled();
       if (engine !== 'x64dbg' && [...this.sessions.values()].filter((s) => s.engine !== 'x64dbg').length >= this.cfg.maxSessions) await this.closeOldest();
@@ -149,7 +223,16 @@ class WorkerManager {
       if ((engine === 'ghidra' || engine === 'reverse' && this.cfg.reverseProvider === 'bundled') && [...this.sessions.values()].some((s) => s.engine === engine && s.artifactId === identity.artifactId)) {
         throw new Error('This artifact already has an active database in this analysis lane at another path; close that session before reopening its moved alias');
       }
-      const proc = this.spawnWorker(engine);
+      if (options.guestProfile) {
+        const snapshot = options.guestProfile, registered = guestTarget(snapshot, identity.sha256);
+        session.guestProfile = snapshot;
+        session.remoteLease = this.remoteStore().reserve({ guestCID: snapshot.profile.guestCID, profileName: snapshot.name,
+          profileSha256: snapshot.sha256, bundleSha256: snapshot.profile.bundleSha256, targetSha256: identity.sha256,
+          targetId: registered.id, target: session.target, projectRoot: path.resolve(this.cfg.projectRoot) }, this.scope.getStore()?.agentId || 'local');
+      }
+      let proc;
+      try { proc = this.spawnWorker(engine, options.guestProfile); }
+      catch (error) { if (session.remoteLease) this.remoteStore().abandonUnarmed(session.remoteLease, true); throw error; }
       session.proc = proc; proc.__ig5 = session;
       this.sessions.set(key, session);
       return session;
@@ -158,8 +241,8 @@ class WorkerManager {
     return pending;
   }
 
-  spawnWorker(engine = this.scope.getStore()?.engine || this.cfg.defaultEngine || 'reverse') {
-    return spawnWorker(this.cfg, engineId(engine), HERE, {
+  spawnWorker(engine = this.scope.getStore()?.engine || this.cfg.defaultEngine || 'reverse', guestProfile) {
+    return spawnWorker(guestProfile ? { ...this.cfg, guestExecutionProfile: { path: guestProfile.path, sha256: guestProfile.sha256 } } : this.cfg, engineId(engine), HERE, {
       formatError: error => this.rpcError(error), timers: { setTimeout, clearTimeout },
     });
   }
@@ -176,6 +259,10 @@ class WorkerManager {
       return this.open(target, autoAnalysis, options);
     }
     const existing = this.sessions.get(key);
+    if (existing && (Boolean(existing.guestProfile) !== Boolean(options.guestProfile)
+        || existing.guestProfile && (existing.guestProfile.name !== options.guestProfile?.name || existing.guestProfile.sha256 !== options.guestProfile?.sha256)))
+      throw new Error('Debugger execution destination changed; close the original session before switching local/guest profiles');
+    if (existing?.remoteLease && !this.alive(existing)) throw new Error('Guest execution is retained; use approved op=recover with its original guest binding');
     if (this.alive(existing)) {
       if (fresh || options.analysisProfile && existing.info?.analysisProfile !== options.analysisProfile) {
         throw new Error('Target is already open with different analysis settings; close it before requesting fresh or another profile');
@@ -185,11 +272,20 @@ class WorkerManager {
     if (existing) this.killSession(key);
 
     const p = (async () => {
-      const session = await this.admitSession(key, target, engine);
+      const session = await this.admitSession(key, target, engine, options);
       const proc = session.proc;
 
       const onLine = (obj) => {
         if (obj.ig5 === 'ready') {
+          if (session.guestProfile) {
+            const location = obj.executionLocation, snapshot = session.guestProfile;
+            if (location?.kind !== 'vmci-guest' || location.profileSha256 !== snapshot.sha256
+                || location.guestCID !== snapshot.profile.guestCID || location.bundleSha256 !== snapshot.profile.bundleSha256)
+              throw new Error('Guest worker startup identity differs from the selected profile');
+            session.remoteLease = this.remoteStore().bind(session.remoteLease, { guestCID: location.guestCID,
+              bundleSha256: location.bundleSha256, serverInstanceId: location.serverInstanceId, sessionId: location.sessionId });
+            session.executionLocation = location;
+          } else if (obj.executionLocation) throw new Error('Local debugger unexpectedly reported a remote execution destination');
           session.ready = true;
           session.capabilities = obj.capabilities || null;
           return;
@@ -207,6 +303,13 @@ class WorkerManager {
         }
         if (obj.id !== undefined && session.pending.has(obj.id)) {
           const pend = session.pending.get(obj.id);
+          if (session.remoteLease) {
+            if (!obj.error || obj.error.authenticatedGuestResponse === true) this.acceptRemoteResult(session, pend.method, obj.error || obj.result);
+            else if (obj.error.code === 'ETRANSPORT') {
+              // Reject below, then recycle the local bridge while keeping remote custody.
+              this.retainRemoteExecution(session, 'transport-lost');
+            }
+          }
           session.pending.delete(obj.id);
           clearTimeout(pend.timer);
           pend.removeAbort?.();
@@ -219,6 +322,7 @@ class WorkerManager {
               }
             }
             pend.reject(this.rpcError(obj.error));
+            if (session.remoteLease && obj.error.code === 'ETRANSPORT') this.killSession(key);
           }
           else {
             // A false result can follow a partial write. It is never evidence of a rollback.
@@ -247,9 +351,11 @@ class WorkerManager {
         onExit: () => {
           // Includes pipe/protocol failures as well as actual exit; never leave an untracked worker alive.
           if (!proc.__ig5TransportTerminated) terminateTree(proc);
+          if (session.remoteLease && this.retainRemoteExecution(session)) return;
           this.releaseAttachmentAfterExit(session);
-          if (this.sessions.get(key) === session) this.sessions.delete(key);
-          if (session.engine === 'x64dbg') this.debugOwners.delete(path.resolve(session.target).toLowerCase());
+          const current = this.sessions.get(key);
+          if (current === session) this.sessions.delete(key);
+          if (session.engine === 'x64dbg' && (!current || current === session)) this.debugOwners.delete(path.resolve(session.target).toLowerCase());
           session.runtime = null; session.controlOwner = null;
         },
       });
@@ -274,6 +380,8 @@ class WorkerManager {
       } catch (error) { this.killSession(key); throw error; }
       session.attachmentId = attachment.attachmentId;
       session.dbRevision = attachment.dbRevision;
+      try { if (session.remoteLease) session.remoteLease = this.remoteStore().attach(session.remoteLease, attachment); }
+      catch (error) { this.killSession(key); throw error; }
       session.info = { ...session.info, backendEngine: session.info?.engine, ...this.evidence(session), target: session.target, engine };
       session.state = 'open';
       session.lastOp = 'idle';
@@ -318,7 +426,7 @@ class WorkerManager {
 
   rpcError(value) {
     const error = new Error(publicEngineError(value, this.cfg).split('\n').slice(-3).join(' | '));
-    for (const field of ['code', 'committed', 'saved', 'partial_commit', 'recoveryRequired', 'stage', 'journalId', 'revision', 'durableRevision', 'cleanedUp', 'state', 'stateCode', 'runId', 'stopSeq', 'cancelledBeforeExecution', 'transactionRolledBack', 'stdout', 'stderr', 'compatibility', 'exceptionType', 'budget', 'source', 'compatibilityWrites', 'limitations', 'target_executed']) {
+    for (const field of ['code', 'committed', 'saved', 'partial_commit', 'recoveryRequired', 'stage', 'journalId', 'revision', 'durableRevision', 'cleanedUp', 'state', 'stateCode', 'runId', 'stopSeq', 'cancelledBeforeExecution', 'transactionRolledBack', 'stdout', 'stderr', 'compatibility', 'exceptionType', 'budget', 'source', 'compatibilityWrites', 'limitations', 'target_executed', 'executionLocation', 'authenticatedGuestResponse', 'guestCleanupConfirmed']) {
       if (value && typeof value === 'object' && value[field] !== undefined) error[field] = value[field];
     }
     return error;
@@ -361,12 +469,32 @@ class WorkerManager {
   async performDebug(session, params, timeoutMs) {
     if (!this.alive(session)) throw new Error('Target is not open; call ig5_open first');
     const targetKey = path.resolve(session.target).toLowerCase();
+    const previous = this.sessions.get(this.sessionKey(session.target, 'x64dbg'));
+    let guestProfile;
+    if (params.guest_profile !== undefined || params.guest_binding_sha256 !== undefined) {
+      if (params.backend !== 'x64dbg' || typeof params.guest_profile !== 'string' || !/^[a-f0-9]{64}$/.test(params.guest_binding_sha256 || ''))
+        throw new Error('Guest debugging requires explicit backend=x64dbg, guest_profile and inspected guest_binding_sha256');
+      if (previous?.guestProfile) {
+        guestProfile = previous.guestProfile;
+        if (guestProfile.name !== params.guest_profile || guestProfile.sha256 !== params.guest_binding_sha256)
+          throw new Error('Guest binding differs from the existing debugger; close it before switching profiles');
+      } else guestProfile = loadGuestProfile(this.cfg, params.guest_profile, params.guest_binding_sha256);
+    } else if (previous?.guestProfile) throw new Error('Every guest debugger call requires its explicit guest_profile and guest_binding_sha256');
+    if (!guestProfile && this.remoteExecutionStatus().some(row => row.targetSha256 === session.sha256))
+      throw new Error('This artifact has retained guest execution; close or recover that guest session before local execution');
     const owner = this.debugOwners.get(targetKey);
     const backend = params.backend && params.backend !== 'auto' ? params.backend : owner === 'reverse' ? 'auto' : owner || this.cfg.defaultDebugger;
     if (owner && backend !== owner && !(owner === 'reverse' && ['auto', 'bochs', 'win32'].includes(backend))) {
       throw new Error(`Target already has a ${owner} debug session; stop it before switching debugger`);
     }
     const debuggerEngine = backend === 'x64dbg' ? 'x64dbg' : 'reverse';
+    if (params.record_trace && debuggerEngine !== 'x64dbg') throw new Error('Recorded traces require backend=x64dbg');
+    if (params.record_image && (!params.record_trace || debuggerEngine !== 'x64dbg')) throw new Error('record_image requires an approved native recorded trace');
+    if (params.record_events && (!params.record_trace || debuggerEngine !== 'x64dbg')) throw new Error('record_events requires an approved native recorded trace');
+    if (params.interrupt_method && debuggerEngine !== 'x64dbg') throw new Error('interrupt_method requires backend=x64dbg');
+    if (params.thread_id !== undefined && debuggerEngine !== 'x64dbg') throw new Error('thread_id requires backend=x64dbg');
+    if (params.anti_debug_profile && params.anti_debug_profile !== 'none' && debuggerEngine !== 'x64dbg') throw new Error('anti_debug_profile requires backend=x64dbg');
+    if (params.exception_disposition && params.exception_disposition !== 'preserve' && debuggerEngine !== 'x64dbg') throw new Error('exception_disposition requires backend=x64dbg');
     if (debuggerEngine !== 'x64dbg' && (['threads', 'callstack'].includes(params.op)
         || ['bpt', 'unbpt'].includes(params.op) && params.kind === 'hardware')) {
       throw Object.assign(new Error('Threads, callstack and hardware breakpoints require backend=x64dbg; this Reverse debugger does not advertise them'), { code: 'unsupported' });
@@ -384,7 +512,7 @@ class WorkerManager {
     }
     let debugSession = session;
     if (debuggerEngine === 'x64dbg') {
-      await this.open(session.target, false, { engine: 'x64dbg', internal: true });
+      await this.open(session.target, false, { engine: 'x64dbg', internal: true, guestProfile });
       debugSession = this.sessions.get(this.sessionKey(session.target, 'x64dbg'));
     } else if (session.engine !== 'reverse' || this.cfg.reverseProvider === 'bundled') {
       throw new Error('This debugger requires the optional commercial provider; select backend=x64dbg for the bundled core');
@@ -398,6 +526,11 @@ class WorkerManager {
       throw new Error('Debugger pause changed; refresh the current stop context before execution');
     }
     if (params.expected_run_id !== undefined && debugSession.runtime?.runId !== params.expected_run_id) throw new Error('Debugger run changed');
+    if (debugSession.remoteLease) {
+      // Persist before sending even load: it launches an owned native debugger.
+      debugSession.remoteLease = this.remoteStore().arm(debugSession.remoteLease);
+      this.debugOwners.set(targetKey, 'x64dbg');
+    }
     if (!readOnly) debugSession.controlOwner = caller;
     if (['load', 'start'].includes(params.op)) this.debugOwners.set(targetKey, debuggerEngine);
     if (['cont', 'step', 'stepover', 'trace'].includes(params.op)) {
@@ -410,18 +543,24 @@ class WorkerManager {
         ? await this.rpc(debugSession, 'dbg', { ...params, backend }, timeoutMs)
         : await this.rawDebug(session, { ...params, backend }, timeoutMs);
     } catch (error) {
-      if (error.cleanedUp || !this.alive(debugSession)) {
+      if (debugSession.remoteLease) {
+        if (!this.alive(debugSession) || error.code === 'ETRANSPORT') this.killSession(debugSession.key);
+      } else if (error.cleanedUp || !this.alive(debugSession)) {
         this.debugOwners.delete(targetKey);
         debugSession.controlOwner = null;
         debugSession.runtime = { state: 'no-task', stateCode: -1, cleanedUp: true, runId: error.runId, stopSeq: error.stopSeq };
       }
       throw error;
     }
+    if (params.record_trace && result?.recording) {
+      try { result = await saveDebugTrace(this.cfg, session, result, params); }
+      catch (error) { result = { ...result, traceSaved: false, traceArtifactError: error.message, executionAlreadyAttempted: true }; }
+    }
     if (result?.ok !== false && ['load', 'start'].includes(params.op)) this.debugOwners.set(targetKey, debuggerEngine);
-    if (params.op === 'stop' && result?.ok !== false) this.debugOwners.delete(targetKey);
+    if (!debugSession.remoteLease && params.op === 'stop' && result?.ok !== false) this.debugOwners.delete(targetKey);
     if (result?.cacheInvalidated || result?.historyGap) debugSession.runtime = null;
     if (result?.context || result?.runId || result?.state) debugSession.runtime = { ...debugSession.runtime, ...result };
-    if (result?.state === 'no-task') { this.debugOwners.delete(targetKey); debugSession.controlOwner = null; }
+    if (result?.state === 'no-task') { if (!debugSession.remoteLease) this.debugOwners.delete(targetKey); debugSession.controlOwner = null; }
     if (!readOnly && result?.ok !== false) debugSession.controlOwner = params.op === 'stop' || params.control === 'release' || result?.state === 'no-task' ? null : caller;
     return { ...result, engine: debuggerEngine, projectId: session.projectId, artifactId: session.artifactId };
   }
@@ -446,7 +585,13 @@ class WorkerManager {
     try {
       child = this.spawnWorker(engine);
       const result = await doctorWorker(child, { formatError: error => this.rpcError(error) });
+      if (engine === 'x64dbg' && result?.engine === 'x64dbg' && result.ok === false && result.launchVerified === false
+        && result.targetExecuted === false && Object.values(result.launchReadiness || {}).some(row => row?.nativeLaunchAttempted === false
+          && ['blocked-by-application-control', 'unknown-policy-state'].includes(row.state)))
+        return { ...result, runtimeReady: false, startupVerified: false, nativeTargetExecuted: false, scope: 'metadata-and-recorded-launch-blocks-only' };
       if (result?.ok !== true && !(engine === 'reverse' && this.cfg.reverseProvider !== 'bundled' && result?.idalib === 'loaded')) throw new Error('Analysis core did not confirm a successful startup');
+      if (engine === 'x64dbg') return { ...result, provider: engine, engine, runtimeReady: false, startupVerified: false,
+        nativeTargetExecuted: false, scope: 'metadata-only-native-launch-not-probed' };
       if (engine === 'reverse' && this.cfg.reverseProvider !== 'bundled') {
         if (result?.idalib !== 'loaded') throw new Error('Reverse 原生内核没有确认启动完成。');
         if (this.cfg.reverseRuntime) Object.assign(this.cfg.reverseRuntime, { readiness: 'verified', runtimeReady: true, startupVerified: true,
@@ -493,6 +638,7 @@ class WorkerManager {
   }
 
   releaseAttachmentAfterExit(session) {
+    if (session.remoteLease && this.remoteStore().current(session.remoteLease.key)?.state !== 'cleaned') return;
     if (!session.attachmentId || session.attachmentReleased || session.attachmentExitWait) return;
     const release = () => {
       session.attachmentExitWait = false;
@@ -523,10 +669,58 @@ class WorkerManager {
     } catch {
       // already dead
     }
+    if (s.remoteLease) {
+      try { if (this.retainRemoteExecution(s, 'shutdown')) return false; }
+      catch (error) { s.ready = false; s.remoteLeaseError = publicEngineError(error, this.cfg); return false; }
+    }
     this.sessions.delete(key);
     this.releaseAttachmentAfterExit(s);
     if (s.engine === 'x64dbg') this.debugOwners.delete(path.resolve(s.target).toLowerCase());
     s.runtime = null; s.controlOwner = null;
+    return true;
+  }
+
+  async recoverGuest(target, params) {
+    const snapshot = loadGuestProfile(this.cfg, params.guest_profile, params.guest_binding_sha256);
+    const absolute = path.resolve(target), caller = this.scope.getStore()?.agentId || 'local';
+    const matching = this.remoteStore().list().filter(row => row.state !== 'cleaned'
+      && row.binding.guestCID === snapshot.profile.guestCID && path.resolve(row.binding.target).toLowerCase() === absolute.toLowerCase());
+    if (matching.length !== 1) throw Object.assign(new Error(matching.length === 0
+      ? 'No retained execution matches the original target path and guest. This does not confirm remote cleanup. Inspect ig5_status remoteExecutions and the original target/profile; do not restart, change bindings, or repeat this unchanged request to manufacture a receipt.'
+      : 'Multiple retained executions match the original target path and guest. Cleanup ownership is ambiguous; inspect ig5_status remoteExecutions. No execution was released.'),
+      { code: matching.length === 0 ? 'GUEST_RECOVERY_NOT_FOUND' : 'GUEST_RECOVERY_AMBIGUOUS' });
+    const lease = matching[0];
+    if (lease.binding.profileName !== snapshot.name || lease.binding.profileSha256 !== snapshot.sha256 || lease.binding.bundleSha256 !== snapshot.profile.bundleSha256
+        || guestTarget(snapshot, lease.binding.targetSha256).id !== lease.binding.targetId)
+      throw new Error('Recovery profile differs from the original immutable guest binding');
+    if (lease.agentId !== caller && params.control !== 'takeover') throw new Error('Guest execution is controlled by another agent; recovery requires approved control=takeover');
+    const key = this.sessionKey(absolute, 'x64dbg'), original = this.sessions.get(key);
+    if (original && original.remoteLease?.nonce !== lease.nonce) throw new Error('Recovery cannot affect a different debugger generation');
+    if (original) {
+      this.killSession(key);
+      const proc = original.proc;
+      if (proc?.pid && proc.exitCode === null && proc.signalCode == null) {
+        const exited = await new Promise(resolve => {
+          const onExit = () => { clearTimeout(timer); resolve(true); };
+          const timer = setTimeout(() => { proc.removeListener('exit', onExit); resolve(false); }, 5000);
+          proc.once('exit', onExit);
+        });
+        if (!exited) throw new Error('Original bridge exit is unconfirmed; guest custody is retained');
+      }
+    }
+    const proof = await recoverGuestExecution(this.cfg, HERE, snapshot, lease, { signal: this.scope.getStore()?.signal });
+    const completed = this.remoteStore().complete(lease, proof);
+    if (lease.attachment) {
+      const projects = new ProjectStore({ root: lease.binding.projectRoot });
+      const attachment = projects.getAttachment(lease.attachment.attachmentId);
+      if (attachment.projectId !== lease.attachment.projectId || attachment.artifactId !== lease.attachment.artifactId || attachment.engine !== 'x64dbg')
+        throw new Error('Original guest attachment identity differs; cleanup proof was saved but attachment requires inspection');
+      projects.closeAttachment(attachment.attachmentId);
+    }
+    if (original && this.sessions.get(key) === original) { original.remoteLease = completed; this.sessions.delete(key); }
+    if (!this.sessions.has(key)) this.debugOwners.delete(absolute.toLowerCase());
+    return { ok: true, recovered: true, guestExecutionCleaned: true, target: absolute,
+      guestCID: lease.binding.guestCID, originalSessionId: lease.remote.sessionId, cleanup: completed.cleanup, nativeTargetExecuted: false };
   }
 
   async close(target, save = false, engine, { force = false } = {}) {
@@ -543,10 +737,18 @@ class WorkerManager {
       try {
         await Promise.resolve(s.operationQueue).catch(() => {});
         if (debug && this.alive(debug) && this.debugOwners.has(path.resolve(s.target).toLowerCase())) {
-          try { await this.performDebug(s, { op: 'stop', backend: debug.engine === 'x64dbg' ? 'x64dbg' : 'auto', ...(force ? { control: 'takeover' } : {}) }, 10_000); }
+          try { await this.performDebug(s, { op: 'stop', backend: debug.engine === 'x64dbg' ? 'x64dbg' : 'auto',
+            ...(debug.guestProfile ? { guest_profile: debug.guestProfile.name, guest_binding_sha256: debug.guestProfile.sha256 } : {}),
+            ...(force ? { control: 'takeover' } : {}) }, 10_000); }
           catch (error) { if (!force) throw error; diagAppend(this.cfg, `host: debugger stop during shutdown: ${publicEngineError(error, this.cfg)}`); }
         }
-        if (this.alive(s) && s.lastOp !== 'open') {
+        if (debug?.remoteLease) {
+          if (!this.alive(debug)) throw new Error('Guest bridge is disconnected; approved op=recover must confirm original cleanup before closing');
+          const terminal = await this.rpc(debug, 'close', {}, 10_000);
+          if (terminal?.ok === false || this.remoteStore().current(debug.remoteLease.key)?.state !== 'cleaned')
+            throw new Error('Guest terminal cleanup is unconfirmed; custody is retained');
+        }
+        if (!s.remoteLease && this.alive(s) && s.lastOp !== 'open') {
           const result = await this.rpc(s, 'close', {}, 10_000);
           if (result?.ok === false) throw new Error('Engine refused to checkpoint and close; session was retained');
           s.databaseClosed = true;
@@ -555,9 +757,9 @@ class WorkerManager {
         if (!force) { s.closing = false; throw error; }
         diagAppend(this.cfg, `host: forced shutdown after checkpoint failure: ${publicEngineError(error, this.cfg)}`);
       }
-      this.killSession(key);
-      if (debugKey !== key) this.killSession(debugKey);
-      return true;
+      const closed = this.killSession(key);
+      const debugClosed = debugKey === key ? closed : this.killSession(debugKey);
+      return closed !== false && debugClosed !== false;
     })();
     return s.closePromise;
   }
@@ -568,6 +770,7 @@ class WorkerManager {
       key: s.key,
       ...this.evidence(s),
       capabilities: s.capabilities,
+      ...(s.executionLocation ? { executionLocation: s.executionLocation, guestExecutionState: s.remoteLease?.state } : {}),
       runtime: s.runtime ? { state: s.runtime.state, runId: s.runtime.runId, stopSeq: s.runtime.stopSeq } : null,
       alive: this.alive(s),
       ready: s.ready,
@@ -776,13 +979,15 @@ const IG5_WRITE_TOOLS = new Set([
   'ig5_undo', 'ig5_run_idapython', 'ig5_dbg', 'ig5_struct',
   'ig5_switch_repair', 'ig5_emulate',
   'ig5_sync',
+  'ig5_capture_control',
 ]);
 
 function installApprovalGate(ctx, cfg) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (!IG5_WRITE_TOOLS.has(exec?.name)) return next();
     const args = exec?.arguments ?? {};
-    const what = args?.plan_id ?? args?.ea ?? args?.name ?? args?.target ?? '';
+    const destination = args.guest_profile !== undefined ? ` guest=${args.guest_profile} binding=${args.guest_binding_sha256 || '[missing]'}` : '';
+    const what = (args?.plan_id ?? args?.ea ?? args?.name ?? args?.target ?? '') + destination;
     const request = {
       reason: `IG5 写操作待批准: ${exec.name} @ ${what}`,
       displayReason: {
@@ -817,7 +1022,12 @@ function installApprovalGate(ctx, cfg) {
       const rec = {
         ts: new Date().toISOString(),
         tool: exec.name,
-        args: exec.arguments,
+        args: exec.name === 'ig5_capture_control' ? {
+          action: exec.arguments?.action, id: exec.arguments?.id, session_id: exec.arguments?.session_id,
+          scope: exec.arguments?.scope, port: exec.arguments?.port, tls: exec.arguments?.tls,
+          ...(exec.arguments?.request ? { request: { redacted: true, method: exec.arguments.request.method,
+            headerNames: Object.keys(exec.arguments.request.headers || {}), bodyProvided: exec.arguments.request.body !== undefined } } : {}),
+        } : exec.arguments,
         isError: result?.isError === true,
         detail: result?.isError ? result?.error?.message : result?.value,
       };
@@ -837,6 +1047,7 @@ function installDataRoute(ctx, mgr, cfg) {
     'search', 'scan', 'struct', 'cfg', 'slice', 'fingerprint', 'approvals',
     'disasm', 'stack', 'switches', 'vtables', 'microcode',
     'ir', 'debug_state', 'analyses', 'analysis_result',
+    'capture_status', 'capture_history', 'capture_detail',
   ]);
   ctx.inject(['webServer'], (subCtx) => {
     let ws = null;
@@ -868,6 +1079,16 @@ function installDataRoute(ctx, mgr, cfg) {
           }
           if (!readTypes.has(type)) {
             send(400, { error: 'Unsupported read-only data type' });
+            return;
+          }
+          if (type.startsWith('capture_')) {
+            try {
+              if (!mgr.capture) throw new Error('Capture service is unavailable');
+              const data = type === 'capture_status' ? mgr.capture.status()
+                : type === 'capture_detail' ? mgr.capture.get(url.searchParams.get('id'), { session_id: url.searchParams.get('session_id') || undefined })
+                : mgr.capture.readHistory({ offset: Number(url.searchParams.get('offset') || 0), limit: Number(url.searchParams.get('limit') || 20), session_id: url.searchParams.get('session_id') || undefined });
+              Promise.resolve(data).then(value => send(200, { type, data: value }), error => send(200, { error: publicEngineError(error, cfg) }));
+            } catch (error) { send(200, { error: publicEngineError(error, cfg) }); }
             return;
           }
           if (type === 'analyses' || type === 'analysis_result') {
@@ -981,8 +1202,12 @@ function installDataRoute(ctx, mgr, cfg) {
           }
           if (type === 'disasm') params.size = Number(url.searchParams.get('size') || 1024);
           if (type === 'microcode') {
-            params.action = 'inspect'; // UI route cannot request an optimization or repair.
+            params.action = url.searchParams.get('action') === 'deobfuscate' ? 'deobfuscate' : 'inspect'; // Only read-only analysis overlays; never optimization or repair.
             params.maturity = url.searchParams.get('maturity') || 'generated';
+            if (params.action === 'deobfuscate') {
+              params.max_steps = Number(url.searchParams.get('max_steps') || 100000);
+              params.max_evidence = Number(url.searchParams.get('max_evidence') || 128);
+            }
           }
           if (type === 'ir') {
             params.level = url.searchParams.get('level') || 'high';
@@ -1079,6 +1304,7 @@ function dimsOf(info) {
     n_funcs: info.n_funcs,
     segments: info.segments,
     entries: info.entries,
+    entriesMeaning: 'Provider analysis entrypoints; may include program entry and TLS callbacks. Not the PE export table. Use ig5_listing kind=exports for exports.',
     elapsedMs: info.elapsedMs ?? null,
     alreadyOpen: !!info.alreadyOpen,
   };
@@ -1110,10 +1336,15 @@ function defineIg5Tools(ctx, mgr, cfg) {
     {
       name: 'ig5_profile',
       description:
-        'Return IG5 engines, projects, active tools and skills. Optionally switch core (8 frequent tools) or full (38 tools) for the calling agent on hosts supporting agent scopes; older hosts explicitly report plugin-instance scope. workspace manages persistent analysis tasks for an explicitly opened target: caller hypotheses/progress are separate from system dossier observations; updates require expected_task_revision. This changes notes only, not engine databases or execution permissions. History stats/archive/restore retain report IDs and data refs.',
-      parameters: { type: 'object', properties: { target: { type: 'string', description: 'Explicit opened static target, required for workspace' }, workspace: workspaceSchema, toolset: { type: 'string', enum: ['core', 'full'] }, history: { type: 'object', properties: { action: { type: 'string', enum: ['stats', 'archive', 'restore'] }, ids: { type: 'array', minItems: 1, maxItems: 1000, items: { type: 'string' } } }, required: ['action'], additionalProperties: false } }, additionalProperties: false },
+        'Return IG5 engines, projects, active tools and skills, plus the calling agent\'s host Goal availability/state. recovery={case_ref:{path,sha256}} separately reads a bounded recovery case and returns a failure/dependency plan. Alternatively recovery={observations:{recordings:[{id,sha256}],target_sha256,offset,limit}} imports committed debug-trace reports into ordered, source-bound observation pages; no native execution, invented intermediate state or VM/business proof. Alternatively recovery={roles:{recordings:[{id,sha256}],target_sha256}} samples recorded addressing/load/control observations using an owned disassembly-only job; candidates retain ordinary-program ambiguity and do not prove VM roles. Alternatively recovery={flow:{roles_ref:{id,sha256},target}} revalidates a committed role report and recordings, selects a contiguous candidate-to-indirect window, verifies exact raw-file mapping, and uses Java full-state plus source-prefix projections for structural load/index/target dependencies. All stores and ordinary-program ambiguity remain; no VM, semantic-nonconstancy or business proof. All recovery modes save immutable reports and reject other profile options. For sustained reverse engineering use ig5-reverse-agent and native Goal tools. Optionally switch core (8 tools) or full (40) for the calling agent. workspace manages caller notes and separate system dossier evidence for an explicitly opened target; updates require expected_task_revision. History stats/archive/restore retain report IDs and refs.',
+      parameters: { type: 'object', properties: { recovery: recoveryProfileSchema, target: { type: 'string', description: 'Explicit opened static target, required for workspace' }, guest_debug: { type: 'string', description: 'Inspect a configured VMCI guest profile and obtain its bindingSha256 before an approved debugger call; reads files only' }, workspace: workspaceSchema, toolset: { type: 'string', enum: ['core', 'full'] }, history: { type: 'object', properties: { action: { type: 'string', enum: ['stats', 'archive', 'restore'] }, ids: { type: 'array', minItems: 1, maxItems: 1000, items: { type: 'string' } } }, required: ['action'], additionalProperties: false } }, additionalProperties: false },
       output: { schema: { type: 'object', additionalProperties: true }, render: textRender },
       async execute(args = {}, execution) {
+        if (args.collaboration !== undefined) {
+          if (Object.keys(args).some(k => !['collaboration', 'engine'].includes(k))) throw new Error('Use collaboration separately from other profile operations');
+          return { collaboration: mgr.coordination.budget(execution?.agent, args.collaboration) };
+        }
+        if (args.recovery !== undefined) return runRecoveryProfile(mgr, args, cfg);
         if (args.workspace !== undefined) return runWorkspace(mgr, cfg, args, execution);
         if (args.toolset !== undefined) {
           if (!mgr.workflow) throw new Error('IG5 workflow is not ready');
@@ -1122,17 +1353,22 @@ function defineIg5Tools(ctx, mgr, cfg) {
         return {
           plugin: PLUGIN_ID,
           version: PLUGIN_VERSION,
+          implementationRevision: '20261020-controlled-delegation-1',
           engine: cfg.defaultEngine || 'reverse',
           host: cfg.host,
           runtimeSource: Object.fromEntries(['ghidra', 'x64dbg'].map(id => [id, cfg[id]?.source || null])),
           engines: mgr.engines?.() || [],
           projects: mgr.projects?.listProjects?.() || [],
           ...(mgr.workflow?.snapshot(execution) || { toolset: cfg.toolset || 'core' }),
+          autonomy: autonomyStatus(ctx, execution),
           ...(args.history ? { history: await mgr.analysis.history(args.history) } : {}),
           engineConfigured: cfg.defaultEngine === 'reverse' ? cfg.reverseAvailable : !!cfg[cfg.defaultEngine]?.available,
           pythonConfigured: cfg.defaultEngine === 'reverse' ? !!cfg.pythonExe : !!cfg[cfg.defaultEngine]?.pythonExe,
           requestTimeoutMs: cfg.requestTimeoutMs,
           maxSessions: cfg.maxSessions,
+          capture: mgr.capture?.status() || { state: 'idle' },
+          guestDebugProfiles: Object.keys(cfg.guestDebugProfiles || {}),
+          ...(args.guest_debug !== undefined ? { guestDebug: publicGuestProfile(loadGuestProfile(cfg, args.guest_debug)) } : {}),
           tools: [
             'ig5_doctor', 'ig5_open', 'ig5_status', 'ig5_funcs', 'ig5_strings',
             'ig5_decompile', 'ig5_xrefs', 'ig5_calls', 'ig5_bytes', 'ig5_search',
@@ -1142,16 +1378,17 @@ function defineIg5Tools(ctx, mgr, cfg) {
             'ig5_stack', 'ig5_switches', 'ig5_switch_repair*', 'ig5_vtables', 'ig5_microcode', 'ig5_bindiff', 'ig5_emulate*',
             'ig5_ir', 'ig5_sync*',
             'ig5_crypto', 'ig5_protocol',
+            'ig5_capture', 'ig5_capture_control*',
           ],
           writeGated: [...IG5_WRITE_TOOLS],
-          lineage: 'dsh-infinite-gen-4 (提示词层) -> dsh-infinite-gen-5 (纯逆向工具面, 零提示词注入)',
+          lineage: 'dsh-infinite-gen-4 (提示词层) -> dsh-infinite-gen-5 (逆向工具面、按需 Skill 与宿主持久 Goal；无全局 persona 注入)',
         };
       },
     },
     {
       name: 'ig5_doctor',
       description:
-        'Self-check the selected IG5 engine/provider. Default Reverse and Ghidra use the bundled Ghidra runtime; x64dbg uses the bundled debugger. Only an explicitly selected commercial Reverse provider requires a licensed local installation. Reports actual startup status and capabilities; file presence alone is not startup verification.',
+        'Self-check the selected IG5 engine/provider. Default Reverse and Ghidra use the bundled Ghidra runtime; only explicitly selected commercial Reverse requires a licensed local installation. x64dbg reads file layout and retained launch-policy blocks without launching its debugger. not-probed is unknown; known blocks deny native launch before process creation. File presence is not startup verification; no OS policy changes.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: { schema: { type: 'object', additionalProperties: true }, render: textRender },
       async execute(args = {}) {
@@ -1274,12 +1511,12 @@ function defineIg5Tools(ctx, mgr, cfg) {
     {
       name: 'ig5_status',
       description:
-        'List all open IG5 worker sessions: target path, worker pid, uptime, last operation, function count. Use it to check what is loaded before running analysis tools.',
+        'List open IG5 workers and pending remoteExecutions. Separately remoteCleanupEvidence revalidates at most eight stored terminal receipts against original bindings and byte hashes; missing/corrupt evidence stays unknown. An empty pending list is not proof of cleanup. Stored receipt validation is not a new HMAC exchange or authority for newer processes.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: { schema: { type: 'object', additionalProperties: true }, render: textRender },
       execute() {
         const sessions = mgr.status();
-        return { sessions, count: sessions.length, config: { engine: cfg.defaultEngine || 'reverse', engines: mgr.engines?.() || [], maxSessions: cfg.maxSessions } };
+        return { sessions, count: sessions.length, remoteExecutions: mgr.remoteExecutionStatus?.() || [], remoteCleanupEvidence: mgr.remoteCleanupEvidence(), config: { engine: cfg.defaultEngine || 'reverse', engines: mgr.engines?.() || [], maxSessions: cfg.maxSessions } };
       },
     },
     {
@@ -1651,12 +1888,12 @@ function defineIg5Tools(ctx, mgr, cfg) {
     {
       name: 'ig5_listing',
       description:
-        'Enumerate static structures: kind=segments (name/class/perm), imports (module + function), exports (ordinal/name/ea). Paged. Read-only.',
+        'Enumerate static structures: segments, imports, exports (actual export directory, may be partial/unsupported), or entries (analysis entrypoints, NOT exports; may include TLS callbacks and program entry). Preserve source, entryKind and diagnostics. Paged, read-only.',
       parameters: {
         type: 'object',
         properties: {
           target: { type: 'string', description: 'Target path previously opened with ig5_open' },
-          kind: { type: 'string', description: 'segments | imports | exports' },
+          kind: { type: 'string', enum: ['segments', 'imports', 'exports', 'entries'], description: 'exports is distinct from analysis entries/TLS callbacks' },
           offset: { type: 'number', description: 'Skip first N rows' },
           limit: { type: 'number', description: 'Max rows (default 100, max 500)' },
         },
@@ -1666,7 +1903,7 @@ function defineIg5Tools(ctx, mgr, cfg) {
       async execute(args) {
         const target = requireString(args, 'target');
         const kind = requireString(args, 'kind');
-        if (!['segments', 'imports', 'exports'].includes(kind)) throw new Error(`unknown kind: ${kind}`);
+        if (!['segments', 'imports', 'exports', 'entries'].includes(kind)) throw new Error(`unknown kind: ${kind}`);
         return mgr.rpc(mgr.get(target), 'listing', { kind, offset: args?.offset, limit: args?.limit });
       },
     },
@@ -1733,18 +1970,20 @@ function defineIg5Tools(ctx, mgr, cfg) {
     {
       name: 'ig5_dbg',
       description:
-        'Debug lane using the configured debugger, with bundled x64dbg as the default. Optional win32/Bochs debuggers require the explicitly selected commercial Reverse provider. Choose backend explicitly for load. Reports bounded debug events, process state and exception context. Approval-gated; start executes the debuggee. Runtime addresses must not be confused with static database addresses.',
+        'Debug lane using bundled x64dbg by default. Optional paired VMCI guest execution requires backend=x64dbg plus an explicitly inspected guest_profile and guest_binding_sha256 on every call; targets must match its pre-provisioned catalog. op=recover queries the original authenticated terminal cleanup receipt after disconnect, without executing a target: send only target/op/backend/guest_profile/guest_binding_sha256 and optional engine/control; omit timeout and expected_run_id/expected_stop_seq. No matching retained execution is not cleanup proof. Host/bridge exit alone cannot release guest custody. Optional win32/Bochs require the commercial Reverse provider. Approval-gated; start executes the debuggee. Runtime addresses must not be confused with static database addresses.',
       parameters: {
         type: 'object',
         properties: {
           target: { type: 'string', description: 'Target path previously opened with ig5_open' },
           op: {
             type: 'string',
-            description: 'load | start | bpt | unbpt | regs | setreg | threads | callstack | modules | state | event | step | stepover | trace | cont | suspend | readmem | writemem | stop',
+            description: 'load | start | bpt | unbpt | regs | setreg | threads | callstack | modules | state | event | step | stepover | trace | cont | suspend | readmem | writemem | stop | recover',
           },
           kind: { type: 'string', enum: ['software', 'hardware'], default: 'software', description: 'Breakpoint kind for bpt/unbpt' },
           access: { type: 'string', enum: ['execute', 'write', 'readwrite'], default: 'execute', description: 'Hardware breakpoint access' },
           backend: { type: 'string', enum: ['auto', 'x64dbg', 'bochs', 'win32'], description: 'Explicit debugger selection; auto resumes the selected debugger, otherwise uses the configured default (bundled x64dbg). bochs/win32 require the commercial Reverse provider.' },
+          guest_profile: { type: 'string', description: 'Configured VMCI guest profile alias; requires explicit backend=x64dbg and its inspected binding digest on every guest call' },
+          guest_binding_sha256: { type: 'string', pattern: '^[a-f0-9]{64}$', description: 'Exact bindingSha256 returned by ig5_profile guest_debug; fixes guest/catalog/key-reference configuration' },
           control: { type: 'string', enum: ['claim', 'takeover', 'release'], description: 'Explicit approval-gated debugger ownership change' },
           expected_stop_seq: { type: 'number', description: 'Reject a plan made for a previous debugger pause' },
           expected_run_id: { type: 'string' },
@@ -1754,11 +1993,21 @@ function defineIg5Tools(ctx, mgr, cfg) {
           rva: { type: 'string', description: 'Explicit main-module RVA for x64dbg; mapped against the current loaded module' },
           address_space: { type: 'string', enum: ['runtime', 'database', 'rva'], description: 'Explicit address interpretation for x64dbg ea; default runtime' },
           max_steps: { type: 'number', description: 'Bounded x64dbg single-step trace budget' },
+          record_trace: { type: 'boolean', description: 'op=trace only: record actual x64 registers, opcode bytes and memory reads to a hash-bound artifact, max_steps 1..512. Uses approved native single steps; optional explicit ABI widths below enable recoveryArgs.' },
+          record_image: { type: 'boolean', description: 'With record_trace, capture readable main-image pages at the same initial pause, max module 8 MiB. Saves holes and provenance; does not reconstruct imports or patch the original file.' },
+          record_events: { type: 'boolean', description: 'With record_trace, optionally capture bytes at decoded store locations before/after each owned native stop. Shares the original 1 MiB evidence/512 stop/40s budget; preserves unavailable bytes and pause mismatches. Not causal CPU write or VM phase proof. Guest requires an updated verified bundle.' },
+          until: { type: 'string', description: 'Optional trace stop address as an explicit main-module runtime VA, hex' },
+          interrupt_method: { type: 'string', enum: ['native-pause', 'break-process'], description: 'op=suspend only. break-process uses the standard Windows breakpoint interrupt on the already debugged process inside our cleanup job; can interrupt blocked system calls. May switch the current thread; refresh regs/threads afterward.' },
+          thread_id: { type: 'number', description: 'op=regs only: read a selected existing owned x64 debuggee thread while the debugger is paused. Returns selectedThreadRegs and readonly selectedThreadDebuggerVisibility; failed NT visibility queries remain null/unknown. Preserves the active debugger thread/cache.' },
+          anti_debug_profile: { type: 'string', enum: ['none', 'scyllahide-thread-context'], description: 'Explicit x64dbg op=start only. Installs the bundled GPL-3.0 ScyllaHide user-mode context hooks into the owned debuggee after startup pause. Modifies the target environment; records provenance. No drivers or OS security settings changes. Default none.' },
+          exception_disposition: { type: 'string', enum: ['preserve', 'handled'], description: 'Explicit backend=x64dbg op=cont at an observed exception pause only. handled resumes with DBG_CONTINUE and consumes that exception; preserve keeps the debugger default. Changes exception delivery, requires approval, and records the consumed exception.' },
+          trace_inputs: { type: 'array', minItems: 2, maxItems: 2, items: { type: 'string', enum: ['dil', 'sil', 'di', 'si', 'edi', 'esi', 'rdi', 'rsi', 'cl', 'dl', 'cx', 'dx', 'ecx', 'edx', 'rcx', 'rdx'] } },
+          trace_output: { type: 'string', enum: ['al', 'ax', 'eax', 'rax'] },
           expected: { type: 'string', description: 'Optional original register or memory value checked before modification' },
           size: { type: 'number', description: 'Memory byte count (default 64); hardware bpt size 1|2|4|8, execute requires 1' },
           hex: { type: 'string', description: 'Byte payload (writemem)' },
           path: { type: 'string', description: 'Debuggee path override (start)' },
-          timeout: { type: 'number', description: 'Event wait seconds (default 15; cont 30)' },
+          timeout: { type: 'number', description: 'Event wait seconds (default 15; start/cont 30; recorded trace 45), max 60. Explicit backend=x64dbg op=cont allows max 120 with bounded RPC cleanup margin; capture/solver budgets remain unchanged.' },
         },
         required: ['target', 'op'],
       },
@@ -1766,13 +2015,37 @@ function defineIg5Tools(ctx, mgr, cfg) {
       async execute(args) {
         const target = requireString(args, 'target');
         const op = requireString(args, 'op');
-        if (!['load', 'start', 'bpt', 'unbpt', 'regs', 'setreg', 'threads', 'callstack', 'step', 'stepover', 'cont', 'suspend', 'readmem', 'writemem', 'stop', 'state', 'event', 'modules', 'trace'].includes(op)) {
+        if (!['load', 'start', 'bpt', 'unbpt', 'regs', 'setreg', 'threads', 'callstack', 'step', 'stepover', 'cont', 'suspend', 'readmem', 'writemem', 'stop', 'state', 'event', 'modules', 'trace', 'recover'].includes(op)) {
           throw new Error(`unknown dbg op: ${op}`);
         }
+        if (args.guest_profile !== undefined || args.guest_binding_sha256 !== undefined || op === 'recover') {
+          if (args.backend !== 'x64dbg' || typeof args.guest_profile !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(args.guest_profile)
+              || !/^[a-f0-9]{64}$/.test(args.guest_binding_sha256 || '')) throw new Error('Guest debugging requires backend=x64dbg, guest_profile and its inspected guest_binding_sha256');
+        }
+        if (op === 'recover') {
+          validateGuestRecoveryArgs(args);
+          return mgr.recoverGuest(target, args);
+        }
         if (op === 'bpt' && args.kind === 'hardware' && args.size !== undefined && ![1, 2, 4, 8].includes(args.size)) throw new Error('Hardware breakpoint size must be 1, 2, 4 or 8');
+        if (args.record_trace !== undefined && typeof args.record_trace !== 'boolean') throw new Error('record_trace must be boolean');
+        if (args.record_trace && op !== 'trace') throw new Error('record_trace requires op=trace');
+        if (args.record_image !== undefined && typeof args.record_image !== 'boolean') throw new Error('record_image must be boolean');
+        if (args.record_image && !args.record_trace) throw new Error('record_image requires record_trace=true');
+        if (args.record_events !== undefined && typeof args.record_events !== 'boolean') throw new Error('record_events must be boolean');
+        if (args.record_events && !args.record_trace) throw new Error('record_events requires record_trace=true');
+        if ((args.trace_inputs || args.trace_output) && !args.record_trace) throw new Error('Trace recovery registers require record_trace=true');
+        if (args.until !== undefined && op !== 'trace') throw new Error('until requires op=trace');
+        if (args.interrupt_method !== undefined && (op !== 'suspend' || !['native-pause', 'break-process'].includes(args.interrupt_method))) throw new Error('interrupt_method requires a typed op=suspend choice');
+        if (args.thread_id !== undefined && (op !== 'regs' || !Number.isSafeInteger(args.thread_id) || args.thread_id <= 0 || args.thread_id >= 2 ** 32)) throw new Error('thread_id requires op=regs and a positive DWORD thread ID');
+        if (args.anti_debug_profile !== undefined && (!['none', 'scyllahide-thread-context'].includes(args.anti_debug_profile) || args.anti_debug_profile !== 'none' && (op !== 'start' || args.backend !== 'x64dbg'))) throw new Error('anti_debug_profile requires an explicit typed x64dbg start');
+        if (args.exception_disposition !== undefined && (!['preserve', 'handled'].includes(args.exception_disposition) || args.exception_disposition !== 'preserve' && (op !== 'cont' || args.backend !== 'x64dbg'))) throw new Error('exception_disposition requires an explicit typed x64dbg continuation');
+        if (args.record_trace && args.max_steps !== undefined && (!Number.isSafeInteger(args.max_steps) || args.max_steps < 1 || args.max_steps > 512)) throw new Error('Recorded trace max_steps must be 1..512');
+        if (args.trace_inputs && !['dil,sil', 'di,si', 'edi,esi', 'rdi,rsi', 'cl,dl', 'cx,dx', 'ecx,edx', 'rcx,rdx'].includes(args.trace_inputs.join(','))) throw new Error('Trace inputs must be an explicit equal-width RDI/RSI or RCX/RDX pair');
+        const timeout = debugTimeout(args, cfg);
         return mgr.rpc(mgr.get(target), 'dbg', {
           op,
           backend: args?.backend || 'auto',
+          guest_profile: args.guest_profile, guest_binding_sha256: args.guest_binding_sha256,
           kind: args.kind || 'software', access: args.access || 'execute',
           reg: args?.reg,
           value: args?.value,
@@ -1780,10 +2053,15 @@ function defineIg5Tools(ctx, mgr, cfg) {
           size: args?.size,
           hex: args?.hex || '',
           path: args?.path || '',
-          timeout: args?.timeout,
+          timeout: timeout.seconds,
           rva: args.rva, count: args.max_steps, addressSpace: args.address_space, expected: args.expected,
+          record_trace: args.record_trace, record_image: args.record_image, record_events: args.record_events, until: args.until, trace_inputs: args.trace_inputs, trace_output: args.trace_output,
+          interrupt_method: args.interrupt_method,
+          thread_id: args.thread_id,
+          anti_debug_profile: args.anti_debug_profile,
+          exception_disposition: args.exception_disposition,
           control: args.control, expected_stop_seq: args.expected_stop_seq, expected_run_id: args.expected_run_id,
-        }, Math.min(cfg.requestTimeoutMs, 75_000));
+        }, timeout.rpcTimeoutMs);
       },
     },
     {
@@ -1900,58 +2178,11 @@ function defineIg5Tools(ctx, mgr, cfg) {
     ...defineAdvancedTools(mgr, cfg, textRender),
     ...defineIntegrationTools(mgr, cfg, textRender),
     ...defineAnalysisTools(mgr, cfg, textRender),
+    ...defineCaptureTools(ctx, mgr, cfg, textRender),
   ];
 }
 
 // ── ig5dash 会话投影（只折叠已提交的 tool 事件，model-visible ⟺ logged） ────
-function ig5DashDefinition() {
-  const anySchema = { parse: (value) => value };
-  return {
-    key: 'ig5dash',
-    stateVersion: 1,
-    stateSchema: anySchema,
-    init: () => ({ running: null, tool: null, calls: 0, errors: 0, last: null, lastSummary: null, pending: {} }),
-    apply(state, event) {
-      if (!event || typeof event !== 'object') return state;
-      const d = event.data;
-      if (event.type === 'tool/call') {
-        if (typeof d?.name !== 'string' || !d.name.startsWith('ig5_')) return state;
-        const pending = { ...state.pending, [d.callId]: d.name };
-        const ids = Object.keys(pending);
-        while (ids.length > 32) delete pending[ids.shift()];
-        return { ...state, running: d.name, tool: d.name, calls: state.calls + 1, pending };
-      }
-      if (event.type === 'tool/result') {
-        const msg = d?.message ?? {};
-        const cid = msg?.callId ?? d?.callId;
-        const name = (typeof msg?.name === 'string' && msg.name) || (cid && state.pending[cid]) || null;
-        if (!name || !String(name).startsWith('ig5_')) return state;
-        const pending = { ...state.pending };
-        if (cid) delete pending[cid];
-        const isError = !!msg?.isError;
-        let summary = null;
-        const blocks = Array.isArray(msg?.content) ? msg.content : [];
-        for (const b of blocks) {
-          if (b && b.type === 'text' && typeof b.text === 'string') {
-            summary = b.text.slice(0, 120);
-            break;
-          }
-        }
-        return {
-          ...state,
-          running: null,
-          last: name,
-          errors: state.errors + (isError ? 1 : 0),
-          lastSummary: summary,
-          pending,
-        };
-      }
-      return state;
-    },
-    wire: { viewSchema: anySchema, view: (state) => state },
-  };
-}
-
 // ── 插件入口（具名导出，无 default export） ─────────────────────────────────
 export const name = PLUGIN_ID;
 export const inject = ['tools', 'sessionProjections'];
@@ -1959,6 +2190,7 @@ export const inject = ['tools', 'sessionProjections'];
 export function apply(ctx, config = {}) {
   const cfg = resolveConfig(config);
   const mgr = new WorkerManager(cfg);
+  mgr.coordination = installDelegationControl(ctx, cfg);
   installDiagRoute(ctx, cfg);
   installJobsRoute(ctx, mgr, cfg);
   installDataRoute(ctx, mgr, cfg);
@@ -1967,20 +2199,27 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => {
     const definitions = defineIg5Tools(ctx, mgr, cfg).map((definition) => {
       const execute = definition.execute;
-      const isGlobal = ['ig5_profile', 'ig5_status', 'ig5_crypto', 'ig5_protocol'].includes(definition.name);
-      const isData = ['ig5_crypto', 'ig5_protocol'].includes(definition.name);
-      definition.parameters.properties.engine = { type: 'string', enum: definition.name === 'ig5_doctor'
+      const isCapture = ['ig5_capture', 'ig5_capture_control'].includes(definition.name);
+      const isGlobal = isCapture || ['ig5_profile', 'ig5_status', 'ig5_crypto', 'ig5_protocol'].includes(definition.name);
+      const isData = isCapture || ['ig5_crypto', 'ig5_protocol'].includes(definition.name);
+      if (!isCapture) definition.parameters.properties.engine = { type: 'string', enum: definition.name === 'ig5_doctor'
         ? ['reverse', 'ghidra', 'x64dbg'] : ['reverse', 'ghidra'],
         description: isData ? 'Optional result association or static source backend; standalone byte/file/ref analysis does not require an engine.' : 'Explicit backend. Omit to use the configured primary static engine; results identify their source.' };
-      if (IG5_WRITE_TOOLS.has(definition.name) && definition.name !== 'ig5_sync') definition.parameters.properties.expected_revision = {
+      if (definition.name === 'ig5_profile') definition.parameters.properties.collaboration = {
+        type: 'object', properties: { action: { type: 'string', enum: ['start', 'status'] },
+          max_calls: { type: 'integer', minimum: 1, maximum: 1000, description: 'start only: persistent shared cap for parent + all descendant IG5 dispatches; cannot be reset/enlarged' } },
+        required: ['action'], additionalProperties: false,
+        description: 'Use separately BEFORE work: start shared budget, or status (exempt control-plane query). Counts all IG5 calls incl. child profile/open/evidence/errors, not just parent calls. No token/non-IG5 limit.' };
+      if (!isCapture && IG5_WRITE_TOOLS.has(definition.name) && definition.name !== 'ig5_sync') definition.parameters.properties.expected_revision = {
         type: 'number', description: 'Reject this operation if the selected database revision has changed since planning' };
       definition.execute = (args = {}, execution) => mgr.scope.run({ engine: args.engine || (definition.name === 'ig5_ir' && cfg.reverseProvider !== 'bundled' ? 'ghidra' : cfg.defaultEngine), agentId: execution?.agent?.id || execution?.agent?.sessionId, signal: execution?.signal }, async () => {
         if (execution?.signal?.aborted) throw new Error('IG5 operation cancelled');
+        mgr.coordination.charge(execution?.agent, definition.name, args);
         if (args.engine) engineId(args.engine);
         const selected = !args.target && !isGlobal && !['ig5_open', 'ig5_doctor', 'ig5_bindiff', 'ig5_sync'].includes(definition.name)
           && !definition.parameters.required?.includes('target') ? mgr.selectedTarget() : args.target;
         if (selected) args = { ...args, target: selected };
-        const standaloneKernel = definition.name === 'ig5_ir' && args.level === 'kernel';
+        const standaloneKernel = definition.name === 'ig5_ir' && ['kernel', 'trace', 'lift', 'project'].includes(args.level);
         const session = selected && !isData && !standaloneKernel ? mgr.get(selected) : null;
         const selectedAttachment = session?.attachmentId;
         const perform = async () => {
@@ -2014,8 +2253,11 @@ export function apply(ctx, config = {}) {
     mgr.workflow = workflow;
     return async () => {
       await workflow.dispose();
+      await mgr.capture?.dispose();
       await mgr.analysis?.dispose();
       await mgr.kernel?.dispose();
+      await mgr.trace?.dispose();
+      await mgr.lifter?.dispose();
       await Promise.all([...mgr.sessions.values()].filter((s) => s.engine !== 'x64dbg').map((s) => mgr.close(s.target, true, s.engine, { force: true })));
       await Promise.all([...mgr.sessions.values()].map((s) => mgr.close(s.target, true, s.engine, { force: true })));
     };

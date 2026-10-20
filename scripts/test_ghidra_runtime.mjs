@@ -124,7 +124,8 @@ try {
     const truncated = await rpc('ir', { ea: fixture.addresses.add, kind, max_instructions: 1 });
     assert.equal(truncated.count, 1); assert.equal(truncated.truncated, true); check(kind + ' typed p-code', ir.instructions.length);
   }
-  const slice = await rpc('slice', { ea: fixture.addresses.add }); assert(slice.variables.length > 0); assert(slice.lines.length > 0); assert.equal(slice.total_variables, slice.variables.length); assert(slice.slice_lines.every(row => row.line_no && row.code !== undefined)); check('HighFunction symbols', slice.variables.length);
+  const slice = await rpc('slice', { ea: fixture.addresses.add }); assert(slice.variables.length > 0); assert(slice.lines.length > 0); assert.equal(slice.total_variables, slice.variables.length); assert.equal(slice.slice_lines, null);
+  const focusedSlice = await rpc('slice', { ea: fixture.addresses.add, variable: slice.variables[0].name }); assert(focusedSlice.slice_lines.length > 0); assert(focusedSlice.slice_lines.every(row => row.line_no && row.code !== undefined)); check('HighFunction symbols', slice.variables.length);
   const semantics = await rpc('semantics', { limit: 100 }); assert(semantics.functions.length >= 16); assert(semantics.functions.every(row => row.semantic_hash && row.blocks.length)); check('semantic snapshots', semantics.count);
   const inspected = await rpc('inspect', { ea: fixture.addresses.add, size: 5 }); assert.equal(inspected.hex, bytes.hex); assert.equal(inspected.fileOffset, 0x400); check('sync inspect', inspected);
   const renamed = await rpc('rename', { ea: fixture.addresses.add, new_name: 'ig5_test_add' }); assert.equal(renamed.new, 'ig5_test_add');
@@ -160,7 +161,7 @@ try {
   const emulated = await rpc('emulate', { ea: fixture.addresses.add, args: [2, 3], abi: 'win64' });
   assert.equal(emulated.return_value, '0x5'); assert.equal(emulated.reason, 'returned'); assert.equal(emulated.idb_modified, false);
   assert.equal(emulated.sourceEngine, 'ghidra'); check('engine-neutral CPU emulation', emulated.return_value);
-  await assert.rejects(rpc('microcode'), error => error.code === 'unsupported'); check('unsupported explicit');
+  await assert.rejects(rpc('microcode'), error => error.code === 'operation_failed' && /ea or name is required/.test(error.message)); check('missing microcode target rejects explicitly');
   await rpc('close'); assert.equal((await rpc('stats')).open, false);
   const reused = await rpc('open', { path: target }); await rpc('close');
   const persisted = await rpc('open', { path: target }); assert.equal(persisted.reusedProject, true); assert.equal(persisted.project, reused.project);

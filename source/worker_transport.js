@@ -26,13 +26,16 @@ export function workerLaunch(cfg, engine, pluginRoot) {
     const pack = cfg[provider];
     if (!pack?.available) throw new Error(`${builtinReverse ? 'Bundled Reverse' : engine} runtime is unavailable: ${pack?.reason || 'not configured'}`);
     executable = pack.pythonExe;
-    args = ['-I', '-B', paths.join(pluginRoot, 'adapters', provider, provider === 'ghidra' ? 'worker.py' : 'adapter.py')];
+    args = provider === 'x64dbg' && cfg.guestExecutionProfile
+      ? ['-I', '-B', paths.join(pluginRoot, 'adapters', 'vmci', 'adapter.py'), '--profile', cfg.guestExecutionProfile.path, '--profile-sha256', cfg.guestExecutionProfile.sha256]
+      : ['-I', '-B', paths.join(pluginRoot, 'adapters', provider, provider === 'ghidra' ? 'worker.py' : 'adapter.py')];
     if (provider === 'ghidra') Object.assign(env, {
       IG5_GHIDRA_HOME: pack.ghidraHome, IG5_JAVA_HOME: pack.javaHome,
       IG5_GHIDRA_PROJECT_ROOT: paths.join(cfg.projectRoot, builtinReverse ? 'reverse-databases' : 'ghidra-databases'),
       IG5_GHIDRA_ROUTE: engine,
     });
     else Object.assign(env, {
+      ...(cfg.home ? { IG5_HOME: cfg.home } : {}),
       IG5_X64DBG_RUNTIME: pack.manifest,
       IG5_X64DBG_STATE_ROOT: paths.join(cfg.stateRoot || paths.join(cfg.home || cfg.artifactDir || cfg.projectRoot, 'state'), 'x64dbg'),
     });
@@ -57,7 +60,8 @@ export function spawnWorker(cfg, engine, pluginRoot, { spawnProcess = spawn, for
 
 /** JSONL framing and subprocess/request lifetime. Queues, approvals and revisions stay in the host. */
 export class WorkerClient {
-  constructor(proc, { formatError = error => error, timers = { setTimeout, clearTimeout }, limits, terminate = child => { if (typeof child.kill === 'function') terminateTree(child); } } = {}) {
+  constructor(proc, { formatError = error => error, timers = { setTimeout, clearTimeout }, limits, drainOnExit = false, terminate = child => { if (typeof child.kill === 'function') terminateTree(child); } } = {}) {
+    if (typeof drainOnExit !== 'boolean') throw new Error('drainOnExit must be a boolean');
     this.proc = proc;
     this.formatError = formatError;
     this.timers = timers;
@@ -114,7 +118,10 @@ export class WorkerClient {
     proc.stdout?.on('data', this.dataListener);
     proc.stderr?.on('data', this.stderrListener);
     proc.on('error', this.errorListener);
-    proc.on('exit', this.exitListener);
+    // Owned one-request workers can exit before their final stdout frame has
+    // drained. Their caller tracks root exit separately; fail missing replies
+    // only after close confirms that no more protocol bytes can arrive.
+    proc.on(drainOnExit ? 'close' : 'exit', this.exitListener);
     proc.stdin?.on?.('error', this.stdinListener);
   }
 

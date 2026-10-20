@@ -15,7 +15,7 @@ $package = Get-Content -LiteralPath (Join-Path $source 'package.json') -Raw -Enc
 # Validate inputs before creating output or staging directories.
 Assert-IG5PluginSource $source
 $validated = Assert-IG5RuntimePack $runtimeInput
-if ($validated.Manifest.pluginVersion -and [string]$validated.Manifest.pluginVersion -ne [string]$package.version) { throw '运行包与插件版本不符' }
+if ($validated.Manifest.pluginVersion -and -not (Test-IG5RuntimeVersion ([string]$validated.Manifest.pluginVersion) ([string]$package.version))) { throw '运行包与插件版本不符' }
 foreach ($inputPath in @($source, $runtimeInput)) {
     if ($output -eq $inputPath -or $output.StartsWith($inputPath + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '便携包不能写入输入目录内部' }
 }
@@ -41,7 +41,7 @@ Install from PowerShell:
 Then restart DeepSeek Harness and call ig5_doctor.
 
 Reverse is the default bundled analysis lane (reverseProvider=bundled, provider=ghidra).
-All 38 public tools have bundled execution paths; no commercial engine installation is required.
+40 public tools include independent HTTP/HTTPS capture; no Burp program is required.
 The optional commercial compatibility provider requires a separately licensed local installation.
 DeepSeek Harness and commercial programs/licenses are not bundled.
 Upstream licenses, notices, source audit assets and SHA-256 manifests are preserved.
@@ -53,7 +53,7 @@ User projects, sessions, downloads and build caches are excluded.
            sha256 = Get-IG5Hash $_.FullName }
     })
     $manifest = @{ schemaVersion = 1; pluginVersion = $package.version; version = $package.version; platform = 'win32-x64'; createdAt = [DateTime]::UtcNow.ToString('o');
-        engines = @('reverse', 'ghidra', 'x64dbg'); defaultEngine = 'reverse'; reverseProvider = 'bundled'; builtInProvider = 'ghidra'; publicToolCount = 38;
+        engines = @('reverse', 'ghidra', 'x64dbg'); defaultEngine = 'reverse'; reverseProvider = 'bundled'; builtInProvider = 'ghidra'; publicToolCount = 40;
         includesProjects = $false; files = $records }
     [IO.File]::WriteAllText((Join-Path $stage 'manifest.json'), ($manifest | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $stage -Destination $destination

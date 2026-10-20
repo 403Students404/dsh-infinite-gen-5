@@ -1,6 +1,6 @@
-# IG5 1.0.0 重构结构
+# IG5 1.1.0 架构
 
-桌面端保留完整工具面，Core 8 / Full 38 与 12 个工具名称的审批门继续生效。重构围绕执行协议、数据库身份、可移植 CPU 核心和独立数据分析层，不以合并原生数据库作为统一的前提。新增解密/协议工具只处理提供的数据与显式参数，不执行样本或修改原始输入/引擎数据库。
+桌面端保留 Core8 / Full40（25 只读、13 审批、2 生命周期/配置）。重构围绕执行协议、数据库身份、可移植 CPU 核心、独立采集和数据分析层，不以合并原生数据库作为统一的前提。状态分析与去混淆复用已有工具 action，不增加入口；数据分析只处理提供的证据与显式参数，不执行样本或修改原始输入/引擎数据库。
 
 ```mermaid
 flowchart TD
@@ -18,8 +18,14 @@ flowchart TD
   Input --> Jobs[独立 Node 数据 worker · 取消与预算]
   Jobs --> Crypto[有界密钥恢复 · 显式解密 · 解压 · 验证]
   Jobs --> Protocol[捕获解析 · 分帧/字段候选 · 独立复核]
+  Host --> Capture[回环应用代理 · 显式 origin · 审批控制]
+  Capture --> Trace[显式应用会话 · 方向与来源轨迹]
+  Trace --> Jobs
+  Jobs --> State[观察前缀树 · 合并假设 · 留出重放]
+  Ghidra --> Overlay[原生 SSA · SCCP 只读证据覆盖层]
   Crypto --> Artifacts[SHA-256 blobs / UUID reports]
   Protocol --> Artifacts
+  State --> Artifacts
   Artifacts --> ReadOnly[工作台只读历史 / 可复用引用]
 ```
 
@@ -27,7 +33,7 @@ flowchart TD
 | --- | --- | --- |
 | `index.js` | 工具注册、只读路由、审批、会话队列 | 写入修订守卫、取消分类、缓存失效 |
 | `source/worker_transport.js` | 子进程启动、JSONL 分帧、ready / doctor、RPC、超时与退出 | UTF-8 字节预算、启动队列预算、早退出、精确取消、单次完成 |
-| `workflow.js` | Core/Full、技能和命令的注册与清理 | 支持 scoped API 时全局 Core8、当前 agent 展开 Full38；旧宿主明确 instance 作用域 |
+| `workflow.js` | Core/Full、技能和命令的注册与清理 | 支持 scoped API 时全局 Core8、当前 agent 展开 Full40；旧宿主明确 instance 作用域；本地 state/state-validate/deobfuscate 仅调用限定只读 action |
 | `source/host_platform.js` / `engine_runtime.js` | 执行设备身份、平台与原生依赖校验 | 手机浏览器不会改变 worker 的实际平台；不回落到不兼容的 Windows 包 |
 | `source/project_store.js` / `attachment_lease.js` / `address_ref.js` | artifact、attachment、进程所有者、数据库与地址身份 | 宿主及 worker 创建身份与 nonce；物理数据库排他；地址空间不可混用 |
 | `source/audit_history.js` / `patch_export.js` | 审计游标分页、补丁导出来源过滤 | 异步有界读取；当前 artifact/hash/engine 与映射核验；不重放旧样本补丁 |
@@ -36,6 +42,8 @@ flowchart TD
 | `source/analysis_artifacts.js` / `history_index.js` | 内容地址输入/输出、报告、异步索引及归档 | SHA-256 blobs、UUID report、目录身份核验；有界批次与缓存；归档保留报告和引用 |
 | `source/crypto_analysis.js` / `crypto_recovery.js` | XOR/AES、解压、验证及有界密钥候选 | 1 MiB 输入/输出；认证前不发布明文；统计候选不当验证；不穷举随机 AES 全空间 |
 | `source/protocol_analysis.js` / `protocol_inference.js` | 捕获、分帧、字段候选及独立 holdout | 8 MiB 输入；方向/缺口/冲突和预算；有限 framing 推断不当完整协议语义 |
+| `source/capture_state_trace.js` / `protocol_state.js` | 来源绑定的显式轨迹、观察状态建模与新轨迹验证 | 1 MiB JSON；不从 TCP 推会话边界；合并是假设；部分观察保留 unknown；完整保存模型摘要核验 |
+| `adapters/ghidra/deobfuscation_analysis.py` | 原生 SSA 上的 SCCP、位片、条件分支和 dispatcher 证据 | 无内存/调用语义模型；部分图/未完成定点不发布确定证明；不重写 SSA/机器码/数据库 |
 | `adapters/ghidra` | Java 分析、结构化 raw / high p-code、内存提供器 | 保存状态和耐久修订分开；IR 输出有预算与截断标记 |
 | `adapters/x64dbg` | NamedPipe 原生桥、调试执行与暂停上下文 | owner、runId、stopSeq 与审批；真机事件决定状态 |
 | `worker/memory_image.py` | 引擎无关内存区域与有界读取 | 地址范围、重叠、映射预算、缺失字节必须明确 |
@@ -62,7 +70,7 @@ attachment 保存宿主和 worker 的 PID、OS 创建身份以及 nonce。启动
 
 ## 能力边界
 
-自动恢复仍使用独立数据 worker：`crypto_recovery.js` 做预算内 XOR 密钥假设和 AES 候选材料验证，`protocol_inference.js` 做分帧/字段关系候选与 holdout 复核。结果保持统计候选、约束、认证和独立验证的区别；AES 不做随机全空间穷举，协议不自动赋予字段语义或重建通用状态机。完整恢复密钥只以 sensitive blob ref 保存，`recipe.key_ref` 同时核验 producer、完整 mask、样本/引擎/attachment 和修订；不经模型展开秘密。工作台 recover/infer 草稿不自动发送。参数、预算及复用见 [AUTODISCOVERY](AUTODISCOVERY.md)。
+自动恢复仍使用独立数据 worker：`crypto_recovery.js` 做预算内 XOR 密钥假设和 AES 候选材料验证，`protocol_inference.js` 做分帧/字段关系候选与 holdout 复核，`protocol_state.js` 从显式边界的方向轨迹建立观察前缀树和可选合并假设。结果保持统计候选、约束、认证和独立验证的区别；AES 不做随机全空间穷举，协议不自动赋予字段语义或恢复隐藏服务器状态。完整恢复密钥只以 sensitive blob ref 保存，`recipe.key_ref` 同时核验 producer、完整 mask、样本/引擎/attachment 和修订；不经模型展开秘密。工作台草稿不自动发送。恢复参数见 [AUTODISCOVERY](AUTODISCOVERY.md)，状态与 SSA 证据见 [DEOBFUSCATION_STATE](DEOBFUSCATION_STATE.md)。
 
 - `ig5_slice` 是变量表与标识符焦点行，不是完备数据流或污点分析。
 - Ghidra raw p-code 是指令级 IR，high p-code 包含恢复变量与 SSA varnode 信息；它们不等同于 Reverse 微码成熟度。
@@ -72,9 +80,22 @@ attachment 保存宿主和 worker 的 PID、OS 创建身份以及 nonce。启动
 - 虚表、RTTI、跳转表输出依赖已有证据与具体 ABI；未知间接调用不会自动生成确定目标。
 - 图形、调试、同步各自返回真实的预算、暂停身份或提交状态，不能由 UI 推断成功。
 - 熵、压缩头、API 与常量只支持候选判断；CBC padding 成功不证明 key/明文正确。GCM 认证与明确 expected 对比分别报告，缺少 expected 保留 not-requested。
-- TCP 只重建观察到的字节；缺口分成连续片段，冲突保留第一捕获值作为明确假设并禁自动解码。不假造握手前的帧起点，不实现 IP 分片重组、IP/TCP/UDP checksum 验证、实时抓包或协议状态机自动推导。消息尾部 xor8/sum8/CRC32 关系候选与独立 holdout 另行报告，不等同于捕获传输层校验。
+- 离线 TCP 分析只重建观察到的字节；缺口分成连续片段，冲突保留第一捕获值作为明确假设并禁自动解码。不假造握手前的帧起点，不实现 IP 分片重组或 IP/TCP/UDP checksum 验证。实时应用代理是独立采集模块，观察状态建模另外要求显式应用会话和完整性声明；不从 TCP 自动推导业务状态机。消息尾部 xor8/sum8/CRC32 关系候选与独立 holdout 另行报告，不等同于捕获传输层校验。
 - Node 数据层无需商业或开源静态引擎，有合适 Node/worker_threads 宿主即可复用；当前尚未完成 Android/iOS 真机验证或手机原生引擎包，浏览器 UI 兼容不等于离线执行移植。
 
 Unicorn 的 Python 绑定实际加载 `unicorn.dll`；本轮只移除未使用的 49,894,000 字节静态链接档案 `unicorn.lib`。原始 wheel RECORD、移除文件 hash 与许可证保留，所有执行测试仍使用相同原生 DLL。这不改变 Git 历史体积，也不构成 ARM64 宿主二进制移植。
 
 Ghidra 的本地工程路径另有最小源码兼容补丁，允许默认 `.dsh` 目录；项目名、仓库及域内路径仍用原严格校验，点路径穿越保持拒绝。补丁只替换 Project.jar 中的 GhidraURL.class 及对应源码 ZIP entry；固定上游源码不改，Apache 通知、原／新 hash 和可重复构建脚本单独保留。默认工程路径的原生 URL 边界、关闭后进程重开及反编译持久化均有独立真实回归。
+
+
+## v1.1.0 独立应用层采集
+
+DSH 的 ig5_capture_control 经公共审批进入 CaptureService，创建只监听回环地址的 CaptureProxy。流量按批准的 origin 集合转发；正文流式转发，同时只截取配置预算内字节。CaptureService 串行提交 SHA-256 blob/报告和独立 capture-history 元数据，AI/工作台只读分页摘要，显式 export 后才送入原协议/解密 worker。采集未加入静态数据库队列，不改变 IDB revision。
+
+TLS 解密使用本机生成的 EC CA，默认关闭；上游连接仍验证证书。本实现是 Node 宿主内的独立服务模块，并非独立操作系统进程；监听连接数、正文、待保存队列和历史有上限，但不能据此声称完全消除宿主事件循环影响。大规模并发性能需要独立基准。
+
+下发载荷在 `delivered_payload.js` 中做纯字节有界分类；`capture_payload.js` 校验 report 与 blob 哈希、方向和完整性，固定保存 SHA-256 命名样本并生成独立 provenance 报告。此步骤无网络、引擎 RPC 或样本执行。显式 `ig5_open` 后的静态项目依旧使用原 artifactId/attachment/revision；以相同 SHA 建立输入对应关系，不能把网络观察自动提升为函数因果关系或任务 systemEvidence。后者仍只允许真实 dossier 系统捕获。二进制头、JSON/脚本候选与完整行为恢复分开表示。
+
+`state_trace` 同样只读保存证据，校验有序、同 origin、完整 HTTP 交换及正文，生成中性符号和来源摘要。训练与 holdout 不共享记录；相同正文 hash 不等于相同观察来源。`state_validate` 通过生产报告读取完整训练与配置，重建并核验模型摘要，不使用模型/UI 截断视图。部分前缀的不确定性跨已匹配边保留；accepted/rejected 只描述模型关系，合并接受路径明确标记 `fits-merged-hypothesis`。
+
+`deobfuscate` 在私有 Ghidra HighFunction 请求内产生 SCCP 覆盖层，默认 generated/firstpass。受支持位向量常量、位片与奇偶恒等式可证明局部条件；LOAD/CALL 不建语义模型，可达 BRANCHIND 标记控制流不完整。原生图 partial 或分析预算耗尽时不发布常量、边剪枝、不可达块与 dispatcher 证明。此路径不改 SSA 或数据库、不重新生成去混淆 C，不等同通用去平坦化、任意 VM 去壳或隐藏服务器实现恢复。

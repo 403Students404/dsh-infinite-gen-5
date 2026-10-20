@@ -1,5 +1,5 @@
 // Isolated compatibility checks against actual services shipped in a DSH app.asar.
-// This never starts DSH or an analysis/debug worker and never changes its profile.
+// This never starts DSH or a native analysis/debug worker or changes its profile.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -141,7 +141,7 @@ if (declaredPeers.length) {
   }
 }
 const compatibility = { verification: 'Verbatim functions extracted from actual installed app-boot, called with actual SDK semver; not a full boot-module import', source: bootSourcePath, evidencePath: bootEvidencePath, sha256: createHash('sha256').update(bootBytes).digest('hex'), helperNames: [objectHelper, 'runtimeVersionOf', 'identityField', 'evaluatePluginCompatibility'], runtimeVersionOrigin: `${appBoot.name}/package.json`, peerConstraintPresent: !!declaredPeers.length, matrix: compatibilityMatrix };
-const writeNames = ['ig5_rename', 'ig5_patch_bytes', 'ig5_comment', 'ig5_analyze', 'ig5_set_type', 'ig5_undo', 'ig5_run_idapython', 'ig5_dbg', 'ig5_struct', 'ig5_switch_repair', 'ig5_emulate', 'ig5_sync'];
+const writeNames = ['ig5_rename', 'ig5_patch_bytes', 'ig5_comment', 'ig5_analyze', 'ig5_set_type', 'ig5_undo', 'ig5_run_idapython', 'ig5_dbg', 'ig5_struct', 'ig5_switch_repair', 'ig5_emulate', 'ig5_sync', 'ig5_capture_control'];
 const blockedProcesses = [], processIdentityQueries = [], originals = new Map();
 for (const name of ['spawn', 'exec', 'execFile', 'fork', 'spawnSync', 'execSync', 'execFileSync']) {
   originals.set(name, childProcess[name]);
@@ -232,17 +232,30 @@ try {
   const switchResult = await context.commands.execute(a, '/ig5 toolset full', [], new AbortController().signal);
   assert.equal(switchResult.result.kind, 'success');
   const schemas = context.tools.schemas(a);
-  assert.equal(schemas.length, 38); assert.equal(context.tools.schemas(b).length, 8); assert.equal(context.tools.schemas().length, 8);
+  assert.equal(schemas.length, 40); assert.equal(context.tools.schemas(b).length, 8); assert.equal(context.tools.schemas().length, 8);
   assert(schemas.every(schema => schema.name.startsWith('ig5_') && schema.parameters.type === 'object'));
   assert.equal(context.tools.get('ig5_crypto', b), undefined); assert(context.tools.get('ig5_crypto', a));
-  pass('Actual IG5 Core8/Full38 schemas through installed DSH registry; two agent scopes remain isolated');
+  pass('Actual IG5 Core8/Full40 schemas through installed DSH registry; two agent scopes remain isolated');
   const skills = (await context.skills.list({ scope: a })).filter(item => item.name.startsWith('ig5-'));
-  assert.equal(skills.length, 7);
+  assert.equal(skills.length, 8);
   for (const summary of skills) { const skill = await context.skills.get(summary.name, { scope: a }); assert(skill?.content?.length > 50); assert.equal(skill.invocation.modelInvocable, true); }
-  pass('All seven actual bundled skills register and load through installed DSH Skill service');
+  pass('All eight actual bundled skills register and load through installed DSH Skill service');
   const snapshot = context.sessionProjections.restore({}, [], 0, { id: 'isolated-sdk-session' }, 0).snapshot;
   assert.equal(snapshot.values.ig5dash.calls, 0);
   pass('Actual IG5 session projection registers and validates through installed DSH projection service');
+  const dashEvents=[
+    {seq:0,type:'tool/call',data:{callId:'dash-a',name:'ig5_ir'}},
+    {seq:1,type:'tool/call',data:{callId:'dash-b',name:'ig5_decompile'}},
+    {seq:2,type:'tool/result',data:{message:{toolCallId:'dash-a',isError:true,content:[{type:'text',text:'expected diagnostic refusal'}]}}},
+    {seq:3,type:'tool/result',data:{message:{toolCallId:'dash-a',isError:true,content:[]}}},
+    {seq:4,type:'tool/result',data:{message:{toolCallId:'dash-b',isError:false,content:[]}}},
+  ];
+  const staleDash={ig5dash:{ver:1,seq:4,val:{running:'ig5_ir',calls:999,errors:0,pending:{'dash-a':'ig5_ir'}}}};
+  const repaired=context.sessionProjections.restore(staleDash,dashEvents,0,{id:'isolated-sdk-replayed-session'},0);
+  assert.equal(repaired.snapshot.values.ig5dash.running,null);
+  assert.equal(repaired.snapshot.values.ig5dash.calls,2);assert.equal(repaired.snapshot.values.ig5dash.errors,1);
+  assert.equal(repaired.checkpoint.ig5dash.ver,2);
+  pass('Actual projection service refolds old version1 cache and settles toolCallId/error/concurrent/replayed results once');
   const execute = (name, args = {}, agent = a) => context.tools.execute({ name, arguments: args, agent, signal: new AbortController().signal, callId: `sdk-${name}` });
   for (const name of ['ig5_status', 'ig5_profile']) {
     const result = await execute(name);
@@ -254,6 +267,88 @@ try {
       console.error(`FAIL ${name} canonical output: ${JSON.stringify(outputFailures.at(-1))}`);
     } else assert(result.value && Array.isArray(result.content));
   }
+  const recoveryCasePath = path.join(runRoot, 'recovery-case.json');
+  const recoveryCaseBytes = fs.readFileSync(path.join(pluginRoot, 'scripts/fixtures/vm_recovery_case.example.json'));
+  fs.writeFileSync(recoveryCasePath, recoveryCaseBytes);
+  const recoveryCaseSha256 = createHash('sha256').update(recoveryCaseBytes).digest('hex');
+  const recoveryResult = await execute('ig5_profile', { recovery: { case_ref: { path: recoveryCasePath, sha256: recoveryCaseSha256 } } });
+  assert.equal(recoveryResult.isError, false, JSON.stringify(recoveryResult));
+  const recoveryView = recoveryResult.value.recovery;
+  assert.equal(recoveryView.completionAssessment.businessAccepted, false);
+  assert.equal(recoveryView.integration.dshPlanningEntry, 'ig5_profile.recovery');
+  assert.equal(createHash('sha256').update(fs.readFileSync(recoveryView.reportPath)).digest('hex'), recoveryView.reportSha256);
+  assert.equal(approvals.length, 0); assert.deepEqual(blockedProcesses, []);
+  const changedRecoveryCase = await execute('ig5_profile', { recovery: { case_ref: { path: recoveryCasePath, sha256: '0'.repeat(64) } } });
+  assert.equal(changedRecoveryCase.isError, true);
+  assert.match(JSON.stringify(changedRecoveryCase), /differ from the supplied SHA-256/);
+  pass('Actual profile recovery schema/output/read-only report path validates through DSH registry; changed case rejected before referenced reads');
+  const { AnalysisArtifacts } = await import(pathToFileURL(path.join(pluginRoot, 'source/analysis_artifacts.js')).href);
+  const { observationWindow, observationTarget } = await import(pathToFileURL(path.join(pluginRoot, 'scripts/fixtures/vm_observation_cases.mjs')).href);
+  const observationStore = new AnalysisArtifacts(path.join(runRoot, 'artifacts', 'debug-traces'));
+  try {
+    const fixture = observationWindow({ cpuid: true }), input = observationStore.put(fixture.data);
+    const record = observationStore.save({ kind: 'debug-trace', action: 'record', result: { ...fixture.summary, input } });
+    const observations = { recordings: [{ id: record.id, sha256: observationStore.metadata(record.id).result.recordSha256 }], target_sha256: observationTarget, limit: 1 };
+    const response = await execute('ig5_profile', { recovery: { observations } });
+    assert.equal(response.isError, false, JSON.stringify(response));
+    const view = response.value.observations;
+    assert.equal(view.totals.instructions, 4); assert.equal(view.totals.stopGroups, 2);
+    assert.equal(view.stopGroups[0].intermediateStateAvailable, false); assert.equal(view.businessAccepted, false);
+    assert.equal(createHash('sha256').update(fs.readFileSync(view.reportPath)).digest('hex'), view.reportSha256);
+    const wrongDigest = structuredClone(observations); wrongDigest.recordings[0].sha256 = '0'.repeat(64);
+    for (const args of [{ recovery: { observations: wrongDigest } }, { recovery: { observations, case_ref: { path: recoveryCasePath, sha256: recoveryCaseSha256 } } }, { recovery: { observations }, toolset: 'full' }])
+      assert.equal((await execute('ig5_profile', args)).isError, true);
+    assert.equal(approvals.length, 0); assert.deepEqual(blockedProcesses, []);
+    pass('Actual profile observations schema/worker/report passes DSH registry; mixed modes and wrong SHA rejected without native execution');
+    const { storeEventCase } = await import(pathToFileURL(path.join(pluginRoot, 'scripts/fixtures/vm_store_event_cases.mjs')).href);
+    const { saveDebugTrace } = await import(pathToFileURL(path.join(pluginRoot, 'source/debug_trace.js')).href);
+    const storeFixture = storeEventCase();
+    const stored = await saveDebugTrace({ artifactDir: path.join(runRoot, 'artifacts') }, { target: path.join(runRoot, 'synthetic-not-executed.exe'), sha256: observationTarget }, storeFixture.native, { record_events: true });
+    const storeResponse = await execute('ig5_profile', { recovery: { observations: { recordings: [{ id: stored.traceReportId, sha256: stored.traceReportSha256 }], target_sha256: observationTarget } } });
+    assert.equal(storeResponse.isError, false, JSON.stringify(storeResponse));
+    assert.equal(storeResponse.value.observations.stopGroups[0].memoryWrites.stores[0].afterHex, '8877665544332211');
+    assert.equal(storeResponse.value.observations.stopGroups[0].memoryWrites.actualWriteCausalityProved, false);
+    assert.equal(approvals.length, 0); assert.deepEqual(blockedProcesses, []);
+    pass('Actual DSH schema/output preserves optional source-bound store events and unknown CPU/write proof');
+  } finally { await observationStore.dispose(); }
+  const flowSchema=schemas.find(item=>item.name==='ig5_profile').parameters.properties.recovery.properties.flow;
+  assert.equal(flowSchema.additionalProperties,false);assert.deepEqual(flowSchema.required,['roles_ref','target']);
+  assert.equal(flowSchema.properties.semantic_check.type,'boolean');
+  for(const args of [
+    {recovery:{flow:{roles_ref:{id:'invalid',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe')}}},
+    {recovery:{flow:{roles_ref:{id:'invalid',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe'),projection_decoder:'native'}}},
+    {recovery:{flow:{roles_ref:{id:'invalid',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe'),semantic_check:true}}},
+    {recovery:{flow:{roles_ref:{id:'invalid',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe'),semantic_check:'true'}}},
+  ])assert.equal((await execute('ig5_profile',args)).isError,true);
+  assert.equal(approvals.length,0);assert.deepEqual(blockedProcesses,[]);
+  pass('Actual DSH flow schema and invalid-reference/decoder-override refusals preserve no native dispatch');
+  const recurrenceSchema=schemas.find(item=>item.name==='ig5_profile').parameters.properties.recovery.properties.recurrences;
+  assert.equal(recurrenceSchema.additionalProperties,false);assert.deepEqual(recurrenceSchema.required,['flow_ref']);
+  assert.deepEqual(recurrenceSchema.properties.sample_strategy.enum,['first4-last4','distinct-source-targets']);
+  assert.equal(recurrenceSchema.properties.pair_offset.maximum,255);
+  for(const args of [
+    {recovery:{recurrences:{flow_ref:{id:'invalid',sha256:'a'.repeat(64)}}}},
+    {recovery:{recurrences:{flow_ref:{id:'11111111-1111-1111-1111-111111111111',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe')}}},
+    {recovery:{recurrences:{flow_ref:{id:'invalid',sha256:'a'.repeat(64)}},flow:{}}},
+  ])assert.equal((await execute('ig5_profile',args)).isError,true);
+  assert.equal(approvals.length,0);assert.deepEqual(blockedProcesses,[]);
+  pass('Actual DSH recurrence schema rejects uncommitted references, caller target and mixed modes without native dispatch');
+  for(const args of [
+    {recovery:{recurrences:{flow_ref:{id:'invalid',sha256:'a'.repeat(64)},sample_strategy:'invented'}}},
+    {recovery:{recurrences:{flow_ref:{id:'invalid',sha256:'a'.repeat(64)},pair_offset:0}}},
+    {recovery:{recurrences:{flow_ref:{id:'invalid',sha256:'a'.repeat(64)},sample_strategy:'distinct-source-targets',pair_offset:256}}},
+  ])assert.equal((await execute('ig5_profile',args)).isError,true);
+  assert.deepEqual(blockedProcesses,[]);assert.equal(approvals.length,0);
+  pass('Actual DSH diverse-pair schema validates bounded strategy/page selection before any native dispatch');
+  const handlerSchema=schemas.find(item=>item.name==='ig5_profile').parameters.properties.recovery.properties.handlers;
+  assert.equal(handlerSchema.additionalProperties,false);assert.deepEqual(handlerSchema.required,['recurrences_ref','target']);
+  for(const args of [
+    {recovery:{handlers:{recurrences_ref:{id:'invalid',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe')}}},
+    {recovery:{handlers:{recurrences_ref:{id:'invalid',sha256:'a'.repeat(64)},target:path.join(runRoot,'never-opened.exe'),projection_path:['0x1234']}}},
+    {recovery:{handlers:{},recurrences:{}}},
+  ])assert.equal((await execute('ig5_profile',args)).isError,true);
+  assert.equal(approvals.length,0);assert.deepEqual(blockedProcesses,[]);
+  pass('Actual DSH handler schema rejects uncommitted sources, caller addresses and mixed modes before native dispatch');
   const status = await context.commands.execute(a, '/ig5 status', [], new AbortController().signal);
   assert.equal(status.result.kind, 'success'); assert.match(status.result.text, /sessions/);
   const refusedCommand = await context.commands.execute(a, '/ig5 patch', [], new AbortController().signal);
@@ -268,8 +363,8 @@ try {
     assert.match(JSON.stringify(result), /approval (?:was )?rejected|user rejected tool/, `${name} must reach the real approval seam; received ${JSON.stringify(result)}; pre calls ${JSON.stringify(preCalls)}; approvals ${JSON.stringify(approvals)}`);
     assert.equal(approvals.at(-1)?.toolName, name);
   }
-  assert.equal(approvals.length, 12); assert.deepEqual(blockedProcesses, []);
-  pass('All twelve real write/execution schemas reach DSH approval and are denied without starting a worker');
+  assert.equal(approvals.length, 13); assert.deepEqual(blockedProcesses, []);
+  pass('All thirteen real write/execution schemas reach DSH approval and are denied without starting a worker');
   approvalOutcome = 'cancelled';
   const cancelled = await execute('ig5_rename', minimal(schemas.find(item => item.name === 'ig5_rename').parameters));
   assert.equal(cancelled.isError, true); assert.match(JSON.stringify(cancelled), /ABORTED_BEFORE_DISPATCH|cancelled|取消/);
@@ -306,8 +401,23 @@ try {
   pass('Cancelled, unavailable, unknown, throwing, missing-agent and missing-service approvals fail closed; confirmed approval reaches the inert body');
   assert.equal((await context.commands.execute(b, '/ig5 toolset full', [], new AbortController().signal)).result.kind, 'success');
   assert.equal((await context.commands.execute(a, '/ig5 toolset core', [], new AbortController().signal)).result.kind, 'success');
-  assert.equal(context.tools.schemas(a).length, 8); assert.equal(context.tools.schemas(b).length, 38);
+  assert.equal(context.tools.schemas(a).length, 8); assert.equal(context.tools.schemas(b).length, 40);
   pass('Core/Full command changes remain independent after real policy denials');
+  // Actual installed tool schema/dispatcher, with controlled session lineage.
+  // Native subagent lifecycle is tested separately in the live DSH GUI.
+  a.session.header = { id: a.id };
+  b.session.header = { id: b.id, parentSession: a.id };
+  const budgetStarted = await execute('ig5_profile', { collaboration: { action: 'start', max_calls: 2 } });
+  assert.equal(budgetStarted.isError, false);
+  assert.equal((await execute('ig5_profile')).isError, false);
+  assert.equal((await execute('ig5_profile', {}, b)).isError, false);
+  const budgetBlocked = await execute('ig5_profile', {}, b);
+  assert.equal(budgetBlocked.isError, true);
+  assert.match(JSON.stringify(budgetBlocked), /budget exhausted/);
+  const ledger = await execute('ig5_profile', { collaboration: { action: 'status' } }, b);
+  assert.equal(ledger.isError, false); assert.equal(ledger.value.collaboration.used, 2);
+  assert.deepEqual(ledger.value.collaboration.byAgent, { 'sdk-A': 1, 'sdk-B': 1 });
+  pass('Actual installed DSH schema/dispatcher enforces shared parent-child IG5 budget and preserves exempt status after exhaustion');
   await owner.dispose(); owner = null;
   assert.equal(context.tools.schemas(a).length, 0); assert.equal(context.tools.schemas(b).length, 0);
   assert.equal((await context.skills.list({ scope: a })).filter(item => item.name.startsWith('ig5-')).length, 0);

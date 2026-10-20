@@ -54,7 +54,7 @@ function noSecrets(record) {
 let disposed = false;
 try {
   apply(ctx, { toolset: 'full', artifactDir: artifactRoot, projectRoot: path.join(runRoot, 'projects'), requestTimeoutMs: 120000 });
-  assert.equal(tools.size, 38);
+  assert.equal(tools.size, 40);
   for (const engine of ['reverse', 'ghidra']) {
     await call('ig5_open', { target, path: target, engine, background: false, analysis_profile: 'interactive', analysis_timeout: 60 });
     const opened = (await call('ig5_status')).sessions.find(row => row.target === target && row.engine === engine);

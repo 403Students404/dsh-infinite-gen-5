@@ -15,7 +15,7 @@ assert(start >= 0 && end > start, 'Actual product approval gate must be present'
 const install = vm.runInNewContext(source.slice(start, end) + '\ninstallApprovalGate;', {
   diagAppend() {}, fs: new Proxy({}, { get() { throw new Error('Approval gate test must not access writable file APIs'); } }),
 }, { filename: 'actual-product-approval-gate.js' });
-const gated = ['rename', 'patch_bytes', 'comment', 'analyze', 'set_type', 'undo', 'run_idapython', 'dbg', 'struct', 'switch_repair', 'emulate', 'sync'].map(name => 'ig5_' + name);
+const gated = ['rename', 'patch_bytes', 'comment', 'analyze', 'set_type', 'undo', 'run_idapython', 'dbg', 'struct', 'switch_repair', 'emulate', 'sync', 'capture_control'].map(name => 'ig5_' + name);
 const results = []; let sequence = 0;
 function host(outcome, seam = 'service') {
   if (arguments.length === 0) outcome = 'allowed-once';

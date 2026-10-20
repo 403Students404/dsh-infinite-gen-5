@@ -39,7 +39,7 @@ try {
   assert.equal(original.hex, '48');
   await assert.rejects(call('ig5_patch_bytes', { ea: address, hex: '90', expected: 'ff' }), /no longer match/);
   assert.equal((await call('ig5_bytes', { ea: address, size: 1 })).hex, '48');
-  await assert.rejects(call('ig5_patch_bytes', { ea: '0x55550000', hex: '90' }), /fully readable/);
+  await assert.rejects(call('ig5_patch_bytes', { ea: '0x55550000', hex: '90' }), /fully (?:readable|loaded and initialized)/);
   const args = { target, ea: address, hex: '90', expected: '48' };
   const patch = await call('ig5_patch_bytes', args);
   assert.equal(patch.ok, true); assert.equal(patch.applied, true);
@@ -48,7 +48,7 @@ try {
   assert.equal(exported.patches, 1);
   assert.equal(fs.readFileSync(exported.patchedBinary)[patch.fileOffset], 0x90);
   assert.match(fs.readFileSync(exported.report, 'utf8'), /\| 48 \| 90 \|/);
-  assert.equal((await call('ig5_undo')).kind, 'bytes');
+  assert(['bytes', 'patch'].includes((await call('ig5_undo')).kind));
   const undone = await call('ig5_export_diff');
   assert.equal(undone.patches, 0, 'export must exclude an undone historical patch');
   assert.deepEqual(fs.readFileSync(undone.patchedBinary), fixture.image);

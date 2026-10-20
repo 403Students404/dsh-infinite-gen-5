@@ -25,9 +25,13 @@ import time
 from types import SimpleNamespace
 import uuid
 
+# -I omits the script directory. Only this fixed owned helper directory is added.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_policy import read_block, component_key, assert_launch_permitted, record_block, RuntimePolicyBlocked
+
 OPS = ["load", "start", "bpt", "unbpt", "regs", "setreg", "step", "stepover",
        "cont", "suspend", "readmem", "writemem", "stop", "state", "event", "modules", "trace", "threads", "callstack"]
-CAPABILITIES = ["doctor", "open", "close", "dbg", *["dbg." + op for op in OPS], "dbg.hardware_breakpoint", "cancel"]
+CAPABILITIES = ["doctor", "open", "close", "dbg", *["dbg." + op for op in OPS], "dbg.hardware_breakpoint", "dbg.record_trace", "dbg.record_events", "cancel"]
 EVENT_NAMES = {"EVENT_BREAKPOINT": "breakpoint", "EVENT_SYSTEMBREAKPOINT": "system-breakpoint",
                "EVENT_STEPPED": "step", "EVENT_PAUSE_DEBUG": "paused", "EVENT_RESUME_DEBUG": "running",
                "EVENT_EXCEPTION": "exception", "EVENT_CREATE_PROCESS": "process-started",
@@ -186,7 +190,7 @@ class NativeClient:
                 if len(self.incoming) > 4 * 1024 * 1024:
                     raise RpcError("ETRANSPORT", "native bridge response limit exceeded")
             else:
-                time.sleep(0.005)
+                time.sleep(0.001)
         line, _, remaining = self.incoming.partition(b"\n")
         self.incoming = bytearray(remaining)
         reply = json.loads(line)
@@ -286,6 +290,8 @@ class Adapter:
         self.config = json.loads(self.config_path.read_text(encoding="utf-8-sig")) if self.config_path.is_file() else {}
         self.root = self.config_path.parent
         data_home = Path(os.environ.get("IG5_HOME") or Path.home() / ".dsh/ig5")
+        self.runtime_policy_root = data_home / 'runtime-policy-blocks'
+        self.runtime_policy_denied = {}
         self.state_root = Path(os.environ.get("IG5_X64DBG_STATE_ROOT") or data_home / "state/x64dbg").expanduser().resolve()
         self.client_factory = client_factory
         self.client = self.proc = self.job = self.log = None
@@ -331,7 +337,19 @@ class Adapter:
             usable = usable and paths["headlessExe"] and paths["headless32Exe"]
         if native:
             usable = usable and all(plugins.values())
+        launch = {}
+        for bits in (32, 64):
+            key = ('headlessExe' if bits == 64 else 'headless32Exe') if self.mode == 'headless' else ('x64dbgExe' if bits == 64 else 'x32dbgExe')
+            component = self.resolve(key)
+            try:
+                blocked = (self.runtime_policy_denied.get(component_key(component)) or read_block(self.runtime_policy_root, component)) if component else None
+                launch[str(bits)] = {'state': 'blocked-by-application-control' if blocked else 'not-probed', 'block': blocked, 'nativeLaunchAttempted': False}
+            except RuntimePolicyBlocked as error:
+                launch[str(bits)] = {'state': 'unknown-policy-state', 'reason': str(error), 'nativeLaunchAttempted': False}
+        files_ready = usable
+        usable = usable and all(row['state'] == 'not-probed' for row in launch.values())
         return {"ok": usable,
+                'filesReady': files_ready, 'launchReadiness': launch, 'launchVerified': False,
                 "engine": "x64dbg", "mode": self.mode, "runtime": str(self.root), "stateRoot": str(self.state_root), "files": paths,
                 "bridge": self.config.get("bridge"), "nativePlugins": plugins,
                 "clientRequired": not native, "clientInstalled": (self.root / "clientdeps/x64dbg_automate/__init__.py").is_file(),
@@ -460,8 +478,18 @@ class Adapter:
     def state(self):
         if self.client is None:
             return {"state": "no-task", "stateCode": -1, "runId": self.run_id, "stopSeq": self.stop_seq, "mode": self.mode}
-        debugging = bool(self.call("is_debugging"))
-        running = bool(self.call("is_running")) if debugging else False
+        if isinstance(self.client, NativeClient):
+            # One atomic native snapshot prevents mixed process-state reads and
+            # avoids a redundant pipe round trip on every recorded instruction.
+            self.check()
+            self.client.drain()
+            snapshot = self.client.request('state')
+            self.sync_native_state(snapshot)
+            debugging = bool(snapshot['debugging'])
+            running = bool(snapshot['running']) if debugging else False
+        else:
+            debugging = bool(self.call("is_debugging"))
+            running = bool(self.call("is_running")) if debugging else False
         result = {"state": "running" if running else "suspended" if debugging else "no-task",
                 "stateCode": 1 if running else 0 if debugging else -1, "debuggerPid": self.proc.pid if self.proc else None,
                 "pid": self.pid if debugging else None, "tid": self.tid if debugging else None,
@@ -543,6 +571,13 @@ class Adapter:
         bits = self.target["bits"]
         key = ("headlessExe" if bits == 64 else "headless32Exe") if self.mode == "headless" else ("x64dbgExe" if bits == 64 else "x32dbgExe")
         exe = self.resolve(key)
+        if exe:
+            try:
+                if component_key(exe) in self.runtime_policy_denied:
+                    raise RuntimePolicyBlocked(self.runtime_policy_denied[component_key(exe)])
+                assert_launch_permitted(self.runtime_policy_root, exe)
+            except RuntimePolicyBlocked as error:
+                raise RpcError('ERUNTIME_POLICY', str(error), runtimePolicyBlock=error.record, nativeLaunchAttempted=False) from error
         if not exe or not exe.is_file():
             raise RpcError("ERUNTIME", "configured debugger executable is unavailable", mode=self.mode, bits=bits)
         if self.mode not in ("headless", "gui-hidden"):
@@ -559,8 +594,22 @@ class Adapter:
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startup.wShowWindow = 0
         args = [str(exe), "-userdir", str(user_dir)]
-        self.proc = subprocess.Popen(args, cwd=exe.parent, stdin=subprocess.PIPE, stdout=self.log, stderr=self.log,
-                                     startupinfo=startup, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            self.proc = subprocess.Popen(args, cwd=exe.parent, stdin=subprocess.PIPE, stdout=self.log, stderr=self.log,
+                                         startupinfo=startup, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as error:
+            if getattr(error, 'winerror', None) == 4551:
+                self.runtime_policy_denied[component_key(exe)] = {'component': component_key(exe), 'winError': 4551, 'source': 'observed-launch-error-not-persisted', 'automaticRetryAllowed': False}
+                try:
+                    block = record_block(self.runtime_policy_root, exe, error)
+                    self.runtime_policy_denied[component_key(exe)] = block
+                except Exception as state_error:
+                    raise RpcError('ERUNTIME_POLICY', 'Application control blocked debugger launch; block state could not be persisted; do not retry',
+                                   runtimePolicyBlock=self.runtime_policy_denied[component_key(exe)], policyStateError=str(state_error)[:256],
+                                   nativeLaunchAttempted=True, nativeTargetExecuted=False) from error
+                raise RpcError('ERUNTIME_POLICY', 'Application control blocked debugger launch; automatic retry retained as blocked',
+                               runtimePolicyBlock=block, nativeLaunchAttempted=True, nativeTargetExecuted=False) from error
+            raise
         self.job = KillJob(self.proc)
         if self.config.get("bridge") == "ig5-native":
             self.client = NativeClient(self)
@@ -597,7 +646,8 @@ class Adapter:
         seconds = float(params.get("timeout", 15))
         if not math.isfinite(seconds):
             raise ValueError("timeout must be finite")
-        return max(0.1, min(seconds, 60))
+        maximum = 120 if params.get('op') == 'cont' else 60
+        return max(0.1, min(seconds, maximum))
 
     def enqueue(self, request):
         """The reader never waits on a full queue, so cancel remains readable."""
@@ -742,6 +792,14 @@ class Adapter:
         # Classify the final pause epoch, never an earlier exception/breakpoint
         # from another stop that happened during a high-priority control.
         resumes = [e["seq"] for e in observed if e["type"] == "EVENT_RESUME_DEBUG"]
+        if isinstance(self.client, NativeClient) and state['state'] == 'suspended':
+            pauses = [e['seq'] for e in observed if e['type'] == 'EVENT_PAUSE_DEBUG' and e.get('stopSeq') == state.get('stopSeq')]
+            if pauses:
+                # The pinned core unlocks RUN before publishing RESUME. A very
+                # fast instruction may publish PAUSE/STEPPED first. A resume
+                # callback delivered after that authoritative pause is not a
+                # second command or proof that the process is now running.
+                resumes = [seq for seq in resumes if seq < max(pauses)]
         epoch = max(resumes, default=mark)
         candidates = [e for e in observed if e["seq"] > epoch]
         if state["state"] == "no-task":
@@ -755,7 +813,8 @@ class Adapter:
                 "eventName": event["eventName"] if event else "paused" if state["state"] == "suspended" else "stopped",
                 "observedEvents": observed[-32:], "context": context, **state}
 
-    def wait_state(self, mark, expected="suspended"):
+    def wait_state(self, mark, expected="suspended", recording=False, recording_deadline=None, recording_start_stop=None):
+        start_stop = self.stop_seq if recording_start_stop is None else recording_start_stop
         while True:
             controlled = self.service_controls()
             if controlled:
@@ -778,14 +837,88 @@ class Adapter:
                 return result
             fresh_stop = any(e["type"] in ("EVENT_PAUSE_DEBUG", "EVENT_STEPPED", "EVENT_EXCEPTION", "EVENT_BREAKPOINT", "EVENT_SYSTEMBREAKPOINT") for e in observed)
             fresh_exit = any(e["type"] in ("EVENT_EXIT_PROCESS", "EVENT_STOP_DEBUG") for e in observed)
+            if recording_deadline is not None and time.monotonic() >= recording_deadline:
+                result = self.wait_result(mark, expected, state, dict(state))
+                result.update(ok=False, stepConfirmed=False, recordingWaitExpired=True)
+                return result
+            if recording and isinstance(self.client, NativeClient) and expected == 'suspended' and state['state'] == 'suspended':
+                final_events = [e for e in observed if e['seq'] > mark]
+                competing = any(e['type'] in ('EVENT_EXCEPTION', 'EVENT_BREAKPOINT', 'EVENT_SYSTEMBREAKPOINT') for e in final_events)
+                pauses = [e for e in final_events if e['type'] == 'EVENT_PAUSE_DEBUG' and e.get('stopSeq') == state['stopSeq']]
+                steps = [e for e in final_events if e['type'] == 'EVENT_STEPPED' and e.get('stopSeq') == state['stopSeq']]
+                # The pinned core publishes PAUSE, then STEPPED, then waits.
+                # Require both callbacks in the same pause epoch; a pause alone
+                # never establishes execution. This avoids general-event settle
+                # delay and repeated module lookups for every recorded step.
+                if not competing and state['stopSeq'] == start_stop + 1 and pauses and steps and max(e['seq'] for e in steps) > max(e['seq'] for e in pauses):
+                    result = self.wait_result(mark, expected, state, dict(state))
+                    result['lateResumeObserved'] = any(e['type'] == 'EVENT_RESUME_DEBUG' and e['seq'] > max(item['seq'] for item in steps) for e in final_events)
+                    return result
+                if not competing and not fresh_exit:
+                    time.sleep(0.001)
+                    continue
             if (state["state"] == expected and (fresh_stop if expected == "suspended" else fresh_exit)) or (fresh_exit and state["state"] == "no-task"):
                 time.sleep(0.06)
                 state = self.state()  # drain events published after the pause callback
                 return self.wait_result(mark, expected, state, self.context())
             time.sleep(0.025)
 
+    def interrupt_owned_debuggee(self):
+        """Standard Windows breakpoint interrupt, only inside our owned job.
+
+        This remains an approved suspend operation. It is never a PID-selectable
+        attach/injection surface; the debugger must already own a live run.
+        """
+        if os.name != 'nt' or not isinstance(self.client, NativeClient) or not self.job or not self.job.handle:
+            raise RpcError('ENOTSUPPORTED', 'Process breakpoint interrupt requires the owned native Windows debugger job')
+        before = self.state()
+        if before['state'] != 'running' or not before.get('pid'): raise RpcError('ESTATE', 'Process interrupt requires an active running debuggee')
+        from ctypes import wintypes as w
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]; kernel.OpenProcess.restype = w.HANDLE
+        kernel.CloseHandle.argtypes = [w.HANDLE]
+        kernel.GetProcessId.argtypes = [w.HANDLE]; kernel.GetProcessId.restype = w.DWORD
+        kernel.IsProcessInJob.argtypes = [w.HANDLE, w.HANDLE, ctypes.POINTER(w.BOOL)]
+        kernel.CheckRemoteDebuggerPresent.argtypes = [w.HANDLE, ctypes.POINTER(w.BOOL)]
+        kernel.DebugBreakProcess.argtypes = [w.HANDLE]; kernel.DebugBreakProcess.restype = w.BOOL
+        # Windows debugger process access, restricted to the verified owned job.
+        handle = kernel.OpenProcess(0x1fffff, False, before['pid'])
+        if not handle: raise RpcError('EBACKEND', 'Could not open owned debuggee for interrupt', winError=ctypes.get_last_error())
+        try:
+            in_job, debugged = w.BOOL(), w.BOOL()
+            if kernel.GetProcessId(handle) != before['pid'] or not kernel.IsProcessInJob(handle, self.job.handle, ctypes.byref(in_job)) or not in_job.value:
+                raise RpcError('ESTATE', 'Interrupt target is outside the owned debugger job')
+            if not kernel.CheckRemoteDebuggerPresent(handle, ctypes.byref(debugged)) or not debugged.value:
+                raise RpcError('ESTATE', 'Interrupt target is not currently debugged')
+            after = self.state()
+            if any(after.get(key) != before.get(key) for key in ['pid', 'runId', 'nativeRunEpoch']) or after['state'] != 'running':
+                raise RpcError('ESTATE', 'Debugger run changed before interrupt')
+            if not kernel.DebugBreakProcess(handle): raise RpcError('EBACKEND', 'Owned process interrupt was rejected', winError=ctypes.get_last_error())
+            return True
+        finally: kernel.CloseHandle(handle)
+
     def dbg(self, p):
         op = str(p.get("op", ""))
+        anti_debug_profile = p.get('anti_debug_profile') or 'none'
+        if anti_debug_profile not in ('none', 'scyllahide-thread-context') or (anti_debug_profile != 'none' and op != 'start'):
+            raise ValueError('anti_debug_profile is a typed native-start-only choice')
+        scylla_bundle = None
+        if anti_debug_profile != 'none':
+            if self.mode != 'headless' or self.config.get('bridge') != 'ig5-native' or not self.target or self.target['bits'] != 64:
+                raise RpcError('ENOTSUPPORTED', 'ScyllaHide requires the owned native x64 headless debugger')
+            if p.get('path') and inspect_pe(p['path'])['bits'] != 64:
+                raise RpcError('ENOTSUPPORTED', 'ScyllaHide start override must be x64')
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from scylla_hide import load_bundle
+            scylla_bundle = load_bundle()
+        disposition = p.get('exception_disposition', 'preserve')
+        if disposition not in ('preserve', 'handled') or (disposition != 'preserve' and op != 'cont'):
+            raise ValueError('exception_disposition is a typed cont-only choice')
+        interrupt_method = p.get('interrupt_method', 'native-pause')
+        if interrupt_method not in ('native-pause', 'break-process') or ('interrupt_method' in p and op != 'suspend'):
+            raise ValueError('interrupt_method is a typed suspend-only choice')
+        if 'thread_id' in p and p['thread_id'] is not None and (op != 'regs' or isinstance(p['thread_id'], bool) or not isinstance(p['thread_id'], int) or not 1 <= p['thread_id'] < 1 << 32):
+            raise ValueError('thread_id requires op=regs and a positive DWORD thread ID')
         if op not in OPS:
             raise ValueError("unsupported debug operation")
         if op == "load":
@@ -842,7 +975,17 @@ class Adapter:
             if not accepted:
                 self.expected_native_run_epoch = None
                 return {"ok": False, "op": op, "error": "debugger rejected target launch", **self.state()}
-            return {"op": op, **self.wait_state(mark)}
+            started_result = {"op": op, **self.wait_state(mark)}
+            if scylla_bundle is not None:
+                from scylla_hide import apply_profile
+                try:
+                    if not isinstance(self.client, NativeClient) or started_result.get('state') != 'suspended':
+                        raise RpcError('ESTATE', 'ScyllaHide requires confirmed native startup pause')
+                    started_result['antiDebugEnvironment'] = apply_profile(self, scylla_bundle, RpcError)
+                except Exception:
+                    self.cleanup()
+                    raise
+            return started_result
         if not self.client:
             raise RpcError("ESTATE", "debugger is not loaded")
         if op in ("regs", "setreg", "bpt", "unbpt", "step", "stepover", "cont", "readmem", "writemem", "modules", "trace", "threads", "callstack"):
@@ -855,7 +998,20 @@ class Adapter:
                 raise RpcError("ENOTSUPPORTED", "operation requires the IG5 native bridge")
             data = self.call(name)
             return {"ok": True, "op": op, **data, "native": True, "context": self.context(), **self.state()}
+        if op == 'trace' and p.get('record_trace') is True:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from trace_recorder import record
+            return record(self, p)
         if op == "regs":
+            if p.get('thread_id') is not None:
+                if not isinstance(self.client, NativeClient): raise RpcError('ENOTSUPPORTED', 'Selected thread context requires the owned native debugger')
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                from native_thread_context import read_thread
+                selected = read_thread(self, p['thread_id'], RpcError, include_debug_status=True)
+                return {'ok': True, 'op': op, 'selectedThreadId': p['thread_id'], 'selectedThreadRegs': selected['registers'],
+                        'selectedThreadDebuggerVisibility': selected['debuggerVisibility'],
+                        'selectedThreadRegisterObservationScope': 'GetThreadContext observation under a stable debugger pause epoch; hidden-thread suspension/coherence is not independently proved',
+                        'activeDebuggerThreadChanged': False, 'source': 'Windows-AMD64-GetThreadContext', 'context': self.context(), **self.state()}
             dump = self.call("get_regs")
             regs = {k: hex(v) for k, v in dump.context.model_dump().items() if isinstance(v, int)}
             return {"ok": bool(regs), "op": op, "regs": regs, "bits": self.target["bits"], "context": self.context(), **self.state()}
@@ -939,6 +1095,23 @@ class Adapter:
             raise RpcError("ESTATE", "debuggee is not active")
         mark = self.event_seq
         command = {"step": "sti", "stepover": "sto", "cont": "run", "suspend": "pause", "stop": "stop"}.get(op)
+        continued_exception = None
+        if disposition == 'handled':
+            if not isinstance(self.client, NativeClient):
+                raise RpcError('ENOTSUPPORTED', 'Explicit exception handling requires the owned native bridge')
+            paused_context = self.context()
+            stops = [event for event in self.event_list(0) if event.get('stopSeq') == paused_context['stopSeq']
+                     and event.get('runId') == paused_context['runId']
+                     and event.get('nativeRunEpoch') == paused_context.get('nativeRunEpoch')
+                     and event.get('eventName') in ('exception', 'breakpoint', 'step', 'system-breakpoint')]
+            exception_event = max(stops, key=lambda event: event['seq'], default=None)
+            if not exception_event or exception_event['eventName'] != 'exception':
+                raise RpcError('ESTATE', 'Explicit exception handling requires an observed exception pause')
+            info = exception_event['data']
+            continued_exception = {'code': info.get('ExceptionCode'), 'ea': info.get('ExceptionAddress'),
+                'firstChance': info.get('dwFirstChance'), 'information': info.get('ExceptionInformation', []),
+                'runId': paused_context['runId'], 'stopSeq': paused_context['stopSeq'], 'threadId': paused_context['tid']}
+            command = 'serun'  # Native x64dbg: DBG_CONTINUE for this exception, then run.
         if op == "trace":
             count = integer(p.get("count", 100))
             if not 1 <= count <= 10000:
@@ -946,9 +1119,26 @@ class Adapter:
             # Conditions remain typed addresses; no arbitrary user command surface.
             condition = "0" if "until" not in p else f"cip=={hex(integer(p['until']))}"
             command = f"ticnd {condition}, {hex(count)}"
-        if not self.call("cmd_sync", command):
+        if continued_exception is not None:
+            # The immutable bridge only exposes run/step/pause/stop. The pinned
+            # headless host also has a standard-input command loop. Send this
+            # ONE constant line through its private owned pipe; never accept a
+            # command, expression or script from the caller. Acceptance is not
+            # execution proof: wait_state below still requires real callbacks.
+            if self.mode != 'headless' or not self.proc or not self.proc.stdin or not self.job or not self.job.handle:
+                raise RpcError('ESTATE', 'Handled exception requires the owned headless command pipe')
+            self.check()
+            self.proc.stdin.write(b'serun\n'); self.proc.stdin.flush()
+            accepted = True
+        else:
+            accepted = self.interrupt_owned_debuggee() if op == 'suspend' and interrupt_method == 'break-process' else self.call('cmd_sync', command)
+        if not accepted:
             return {"ok": False, "op": op, "error": "debugger rejected operation", **self.state()}
         result = self.wait_state(mark, "no-task" if op == "stop" else "suspended")
+        if continued_exception is not None:
+            result.update(exceptionDisposition='handled', continuedException=continued_exception,
+                exceptionContinuationTransport='owned-headless-stdin-fixed-serun')
+        if op == 'suspend': result['interruptMethod'] = interrupt_method
         if op == "trace":
             result.update(maxSteps=count, traceCounter=self.evaluate("$tracecounter") if result["state"] != "no-task" else None, recording=False)
         return {"op": op, **result}
@@ -1039,10 +1229,14 @@ def main():
     sys.stdin.reconfigure(encoding="utf-8", errors="strict")
     sys.stdout.reconfigure(encoding="utf-8", errors="strict", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    # Keep optional native decoder diagnostics away from the JSONL protocol.
+    protocol = os.fdopen(os.dup(sys.stdout.fileno()), 'w', encoding='utf-8', buffering=1)
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = sys.stderr
     output_lock = threading.Lock()
     def send(value):
         with output_lock:
-            print(json.dumps(plain(value), ensure_ascii=False, separators=(",", ":")), flush=True)
+            protocol.write(json.dumps(plain(value), ensure_ascii=False, separators=(",", ":")) + '\n')
     adapter = Adapter()
     adapter.respond = send
     def reader():

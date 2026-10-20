@@ -621,7 +621,14 @@ class Worker:
         kind, rows = params.get('kind', 'segments'), []
         if kind == 'segments':
             rows = self.info()['segments']
-        elif kind in ('imports', 'exports', 'entries', 'names'):
+        elif kind == 'exports':
+            from pe_exports import pe_exports
+            imagebase = int(str(self.program.getImageBase()), 16)
+            result = pe_exports(lambda rva, size: self.read_bytes(self.program.getImageBase().add(rva), size), imagebase)
+            rows = result.pop('rows')
+            offset, limit = max(0, int(params.get('offset', 0))), bounded(params)
+            return dict(result, kind=kind, total=len(rows), offset=offset, rows=rows[offset:offset + limit])
+        elif kind in ('imports', 'entries', 'names'):
             table = self.program.getSymbolTable()
             symbols = table.getExternalSymbols() if kind == 'imports' else table.getAllSymbols(True) if kind == 'names' else (table.getPrimarySymbol(ea) for ea in each(table.getExternalEntryPointIterator()))
             symbols = each(symbols) if hasattr(symbols, 'hasNext') else symbols
@@ -632,7 +639,9 @@ class Worker:
         needle = str(params.get('filter', '')).lower()
         rows = [row for row in rows if needle in str(row.get('name', '')).lower()]
         offset, limit = max(0, int(params.get('offset', 0))), bounded(params)
-        return {'kind': kind, 'total': len(rows), 'offset': offset, 'rows': rows[offset:offset + limit]}
+        return {'kind': kind, 'total': len(rows), 'offset': offset, 'rows': rows[offset:offset + limit],
+                'source': 'ghidra-symbol-table',
+                'semantics': 'analysis-entrypoints-not-export-table' if kind == 'entries' else kind}
 
     def cfg(self, params):
         from ghidra.program.model.block import BasicBlockModel

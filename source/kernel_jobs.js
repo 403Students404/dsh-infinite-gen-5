@@ -9,10 +9,11 @@ const root = fs.realpathSync(path.dirname(fileURLToPath(import.meta.url)) + '/..
 
 /** Isolated, read-only requests; cancellation/disposal terminates only our child. */
 export class KernelJobs {
-  constructor(cfg, { spawnProcess = spawn, terminate = terminateTree, stopTimeoutMs = 5000 } = {}) {
+  constructor(cfg, { spawnProcess = spawn, terminate = terminateTree, stopTimeoutMs = 5000, offlineTrace = false } = {}) {
     if (!Number.isSafeInteger(stopTimeoutMs) || stopTimeoutMs < 1 || stopTimeoutMs > 10000) throw new Error('Invalid kernel cleanup timeout');
     this.cfg = cfg; this.active = new Set(); this.closed = false;
     this.spawnProcess = spawnProcess; this.terminate = terminate; this.stopTimeoutMs = stopTimeoutMs;
+    this.offlineTrace = offlineTrace;
   }
   async run(args, signal) {
     if (this.closed) throw new Error('IG5 kernel service disposed');
@@ -21,8 +22,9 @@ export class KernelJobs {
     const pack = this.cfg.ghidra;
     if (!pack?.available || this.cfg.host?.id !== 'win32-x64') throw new Error('IG5 native kernel requires the bundled Windows x64 runtime');
     const runtimeRoot = fs.realpathSync(path.dirname(pack.manifest));
-    const child = this.spawnProcess(pack.pythonExe, ['-I', '-B', path.join(root, 'worker', 'ig5_kernel.py'),
-      '--runtime-root', runtimeRoot, '--ghidra-home', pack.ghidraHome, '--java-home', pack.javaHome],
+    const workerArgs = this.offlineTrace ? [path.join(root, 'worker', 'ig5_trace.py')]
+      : [path.join(root, 'worker', 'ig5_kernel.py'), '--runtime-root', runtimeRoot, '--ghidra-home', pack.ghidraHome, '--java-home', pack.javaHome];
+    const child = this.spawnProcess(pack.pythonExe, ['-I', '-B', ...workerArgs],
     { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, cwd: root,
       env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
     const item = { child, stopIssued: false, exited: false };
@@ -52,8 +54,8 @@ export class KernelJobs {
     try {
       if (signal?.aborted) abort();
       await client.waitReady(10000);
-      return await client.request(session, 'kernel', args,
-        { timeoutMs: Math.min(60000, this.cfg.requestTimeoutMs || 30000), signal });
+      return await client.request(session, this.offlineTrace ? 'trace' : 'kernel', args,
+        { timeoutMs: this.offlineTrace ? 60000 : Math.min(60000, this.cfg.requestTimeoutMs || 30000), signal });
     } finally {
       signal?.removeEventListener('abort', abort);
       client.dispose();

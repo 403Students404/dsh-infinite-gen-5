@@ -79,11 +79,16 @@ export class AnalysisArtifacts {
     if (hashBytes(data) !== ref.slice(7)) fail('ARTIFACT_CHANGED', 'Analysis blob hash does not match its reference');
     return { data, origin: { kind: 'analysis-ref', ref } };
   }
-  save(record) {
+  save(record, options = {}) {
+    if (!options || typeof options !== 'object' || ![Object.prototype, null].includes(Object.getPrototypeOf(options))
+      || Reflect.ownKeys(options).some(key => !['pretty', 'maxBytes'].includes(key)
+        || !Object.hasOwn(Object.getOwnPropertyDescriptor(options, key), 'value'))) fail('INVALID_INPUT', 'Invalid analysis report options');
+    const { pretty = false, maxBytes = 8 * 1024 * 1024 } = options;
+    if (typeof pretty !== 'boolean' || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 8 * 1024 * 1024) fail('INVALID_INPUT', 'Analysis report options require a Boolean pretty and maxBytes in 1..8388608');
     const id = randomUUID(), createdAt = new Date().toISOString();
     const value = { ...record, schemaVersion: 1, id, createdAt };
-    const data = Buffer.from(JSON.stringify(value));
-    if (data.length > 8 * 1024 * 1024) fail('RESULT_LIMIT', 'Analysis result exceeds 8 MiB');
+    const data = Buffer.from(JSON.stringify(value, null, pretty ? 2 : undefined));
+    if (data.length > maxBytes) fail('RESULT_LIMIT', maxBytes === 8 * 1024 * 1024 ? 'Analysis result exceeds 8 MiB' : `Analysis result exceeds ${maxBytes} bytes`);
     const { result, ...metadata } = value;
     metadata.summary = result?.summary || result?.action || result?.op || value.action;
     metadata.recordSha256 = hashBytes(data);

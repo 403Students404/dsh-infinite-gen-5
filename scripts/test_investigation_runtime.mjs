@@ -124,6 +124,32 @@ try {
   assert.equal(historical.workspace.snapshot.stale, false);
   pass('Repeated dossier hits cache, deduplicates persistent evidence and reads its authenticated report', { taskId: id, taskRevision: recorded.taskRevision, reportId: dossier.investigation.reportId });
 
+  const handoff = (await workspace({ action: 'handoff', id, expected_task_revision: recorded.taskRevision,
+    question: 'Explain the generated branch function input and output',
+    acceptance: 'Read complete dossier and report CFG plus unknown coverage',
+    constraints: 'Read only; return candidates without completing the task' })).workspace;
+  assert.equal(handoff.context.attachmentId, opened.attachmentId);
+  const child = { id: 'investigation-runtime-child' };
+  const childRead = (await call('ig5_profile', { workspace: { action: 'get', id } }, { agent: child })).workspace;
+  assert.equal(childRead.taskRevision, handoff.taskRevision);
+  const snapshotId = handoff.evidence[0].snapshot_id;
+  const childEvidence = (await call('ig5_profile', { workspace: { action: 'evidence', id, snapshot_id: snapshotId } }, { agent: child })).workspace;
+  assert.equal(childEvidence.report.function.ea, fixture.addresses.branch);
+  assert(childEvidence.report.sections.decompile.data.code.length > 0);
+  const returned = { taskId: id, taskRevision: childRead.taskRevision, snapshot_ids: [snapshotId],
+    context: handoff.context, candidateConclusion: 'Candidate based on the bounded native branch dossier',
+    coverage: 'One generated function, static only', unknowns: ['Other inputs and runtime behavior not independently tested'], next_action: 'Parent inspect evidence' };
+  const reviewed = (await workspace({ action: 'review', id, expected_task_revision: returned.taskRevision,
+    snapshot_ids: returned.snapshot_ids })).workspace;
+  assert.equal(reviewed.reportsVerified, true);
+  assert.equal(reviewed.staleEvidence, false);
+  assert.equal(reviewed.semanticAcceptanceVerified, false);
+  assert.equal((await task(id)).status, 'active');
+  assert.equal((await task(id)).taskRevision, recorded.taskRevision);
+  pass('Parent handoff, distinct child identity reads native evidence, parent review retains candidate status', {
+    parentAgent: agent.id, childAgent: child.id, taskId: id, snapshotId, dbRevision: opened.dbRevision,
+    nativeWorkers: true, modelDrivenDelegation: false, childResult: returned });
+
   await expectError(() => workspace({ action: 'update', id, expected_task_revision: created.taskRevision, status: 'completed' }), /STALE_TASK_REVISION/);
   await expectError(() => workspace({ action: 'update', id, expected_task_revision: recorded.taskRevision, verified: true }), /field.*valid|unsupported field/);
   await expectError(() => workspace({ action: 'evidence', id, snapshot_id: randomUUID() }), /INVALID_REF/);
@@ -131,7 +157,7 @@ try {
   assert.equal(paused.status, 'paused'); assert.equal(paused.verified, undefined);
   pass('Task CAS and evidence ownership reject stale updates and caller-forged verification', { taskRevision: paused.taskRevision });
 
-  const full = await call('ig5_profile', { toolset: 'full' }); assert.equal(full.activeTools.length, 38);
+  const full = await call('ig5_profile', { toolset: 'full' }); assert.equal(full.activeTools.length, 40);
   const mutation = { target, ea: fixture.addresses.branch, text: 'IG5 dossier revision fixture', expected_revision: opened.dbRevision };
   let dispatched = false;
   const execution = { agent, callId: `comment-${++sequence}` };
@@ -146,6 +172,12 @@ try {
   assert.equal(revisedTask.systemEvidence.length, 2);
   assert.equal(revisedTask.systemEvidence[0].stale, true); assert.equal(revisedTask.systemEvidence[1].stale, false);
   pass('Approved fixture mutation invalidates cache and preserves old evidence at its original revision', { dbRevision: revised.provenance.dbRevision, staleReasons: revisedTask.systemEvidence[0].staleReasons });
+  await expectError(() => workspace({ action: 'review', id, expected_task_revision: returned.taskRevision,
+    snapshot_ids: returned.snapshot_ids }), /STALE_TASK_REVISION/);
+  const historicalReview = (await workspace({ action: 'review', id, expected_task_revision: revisedTask.taskRevision,
+    snapshot_ids: returned.snapshot_ids })).workspace;
+  assert.equal(historicalReview.staleEvidence, true);
+  pass('Parent rejects old child task revision and marks old database evidence stale', { taskRevision: revisedTask.taskRevision });
 
   await call('ig5_open', { path: target, engine: 'ghidra', background: false });
   await expectError(() => call('ig5_profile', { engine: 'ghidra', workspace: { action: 'get', id } }), /IDENTITY_MISMATCH/);
@@ -166,6 +198,11 @@ try {
   const reopened = await task(id);
   assert.equal(reopened.status, 'paused'); assert.equal(reopened.systemEvidence.length, 2);
   assert(reopened.systemEvidence.every(entry => entry.stale && entry.staleReasons.includes('attachment-changed')));
+  const reopenedReview = (await workspace({ action: 'review', id, expected_task_revision: reopened.taskRevision,
+    snapshot_ids: returned.snapshot_ids })).workspace;
+  assert.equal(reopenedReview.reportsVerified, true);
+  assert.equal(reopenedReview.staleEvidence, true);
+  assert(reopenedReview.evidence[0].snapshot.staleReasons.includes('attachment-changed'));
   const beforeAbort = reopened.taskRevision;
   const controller = new AbortController(); controller.abort();
   await expectError(() => call('ig5_decompile', args, { signal: controller.signal }), /cancelled/i);

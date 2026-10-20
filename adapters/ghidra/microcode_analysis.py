@@ -23,12 +23,12 @@ def _limit(params, key, default, maximum):
 
 
 def _request(params):
-    maturity = str(params.get('maturity', 'glbopt3')).lower().removeprefix('mmat_')
+    action = params.get('action', 'inspect')
+    maturity = str(params.get('maturity', 'generated' if action == 'deobfuscate' else 'glbopt3')).lower().removeprefix('mmat_')
     if maturity not in STAGES:
         raise ValueError('maturity must be one of ' + ', '.join(STAGES))
-    action = params.get('action', 'inspect')
-    if action not in ('inspect', 'optimize'):
-        raise ValueError('microcode action must be inspect or optimize')
+    if action not in ('inspect', 'optimize', 'deobfuscate'):
+        raise ValueError('microcode action must be inspect, optimize or deobfuscate')
     rules = params.get('rules', [])
     if not isinstance(rules, list) or any(not isinstance(rule, str) or rule not in RULES for rule in rules):
         raise ValueError('rules must contain only xor-self or sub-self')
@@ -158,10 +158,16 @@ def _graph(high, limits, monitor):
                        'uninspectedPreds': uninspected_preds, 'uninspectedSuccs': uninspected_succs,
                        'edgesTruncated': block_edges_incomplete,
                        'instructions': instructions, 'truncated': truncated})
+        if outgoing == 2 and hasattr(native_block, 'getTrueOut') and hasattr(native_block, 'getFalseOut'):
+            # Native PcodeBlock's edge slots are false=0, true=1. Address or
+            # list sorting would destroy both this meaning and phi input order.
+            blocks[-1]['trueSuccessor'] = int(native_block.getTrueOut().getIndex())
+            blocks[-1]['falseSuccessor'] = int(native_block.getFalseOut().getIndex())
     varnodes_incomplete = any(r['inputsTruncated'] or r['outputOmitted'] for r in rows)
     text_incomplete = any(r['textTruncated'] for r in rows)
     partial = bool(instructions_incomplete or edges_incomplete or varnodes_incomplete or text_incomplete)
     return {'blocks': blocks, 'edges': edges, 'total_blocks': total,
+            'entryBlock': int(native[0].getIndex()) if total else None,
             'returned_instructions': len(rows), 'truncated': partial,
             'partial': partial, 'scopePartial': partial, 'scopeComplete': not partial,
             'scope': 'current function temporary intermediate representation',
@@ -261,6 +267,10 @@ def run_microcode(worker, params):
         high = _analysis(interface, worker, function, stage, limits, monitor)
         graph = _graph(high, limits, monitor)
         optimization = None
+        deobfuscation = None
+        if action == 'deobfuscate':
+            from deobfuscation_analysis import analyze_deobfuscation
+            deobfuscation = analyze_deobfuscation(graph, params, monitor)
         if action == 'optimize':
             before = _snapshot(graph)
             before_partial = (graph['truncated'] or graph['returned_instructions'] > len(before)
@@ -300,6 +310,7 @@ def run_microcode(worker, params):
                   'maturityMapping': dict(STAGES), 'ea': _addr(function.getEntryPoint()),
                   'func': str(function.getName())[:4096], 'action': action, 'graph_built': True,
                   'idb_modified': False, 'revision': worker.revision, 'optimization': optimization,
+                  'deobfuscation': deobfuscation,
                   'limits': limits, **graph,
                   'source': {'engine': 'Ghidra', 'representation': 'native HighFunction dataflow',
                              'language': str(program.getLanguageID()), 'artifactSHA256': worker.source_hash},

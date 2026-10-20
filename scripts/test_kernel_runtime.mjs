@@ -20,7 +20,7 @@ const ctx = {
 const call = args => tools.get('ig5_ir').execute({ target, level: 'kernel', ...args }, { agent: { id: 'kernel-test' } });
 try {
   apply(ctx, { reverse: false, toolset: 'full', defaultEngine: 'ghidra', artifactDir: path.join(scratch, 'artifacts') });
-  assert.equal(tools.size, 38);
+  assert.equal(tools.size, 40);
   const info = await call({ action: 'info' });
   assert.equal(info.engine, 'IG5 Kernel'); assert.equal(info.commercialEngineUsed, false); assert.equal(info.jvmStarted, false);
   assert.equal(info.image.bits, 64); assert.equal(info.image.sha256, original);

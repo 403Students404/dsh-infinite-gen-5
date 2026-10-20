@@ -13,6 +13,7 @@ import { hostPlatform } from '../source/host_platform.js';
 const scratch = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'ig5-prepare-macos-'));
 const owner = fs.statSync(scratch);
 const script = fileURLToPath(new URL('./prepare_macos_runtime.mjs', import.meta.url));
+const packageVersion = JSON.parse(fs.readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version;
 const host = hostPlatform({ platform: 'darwin', arch: 'arm64', env: {} });
 const pass = title => console.log('PASS', title);
 const keys = ['ghidra', 'python', 'jdk'];
@@ -82,14 +83,18 @@ try {
   assert.equal(result.output, output); assert.ok(result.filesVerified > 20); assert.equal(result.linksVerified, 2);
   assert.equal(fs.readlinkSync(path.join(output, 'ghidra/ghidra/LICENSE.alias')), 'LICENSE');
   assert.equal(fs.readlinkSync(path.join(output, 'ghidra/ghidra/licenses.alias')), 'licenses');
-  for (const name of ['ghidra/python/bin/python3.12', 'ghidra/jdk/Contents/Home/bin/java',
-    'ghidra/ghidra/Ghidra/Features/Decompiler/os/mac_arm_64/decompile',
-    'ghidra/ghidra/Ghidra/Features/Decompiler/os/mac_arm_64/sleigh']) {
-    assert.ok((fs.statSync(path.join(output, name)).mode & 0o111) !== 0, `executable bit: ${name}`);
+  // Windows does not expose POSIX executable bits through stat/chmod. Keep the
+  // assertion active on POSIX hosts, including the real darwin-arm64 pack host.
+  if (process.platform !== 'win32') {
+    for (const name of ['ghidra/python/bin/python3.12', 'ghidra/jdk/Contents/Home/bin/java',
+      'ghidra/ghidra/Ghidra/Features/Decompiler/os/mac_arm_64/decompile',
+      'ghidra/ghidra/Ghidra/Features/Decompiler/os/mac_arm_64/sleigh']) {
+      assert.ok((fs.statSync(path.join(output, name)).mode & 0o111) !== 0, `executable bit: ${name}`);
+    }
   }
   const inventory = JSON.parse(fs.readFileSync(result.inventory, 'utf8'));
   assert.deepEqual([inventory.schemaVersion, inventory.platform, inventory.pluginVersion, inventory.engines],
-    [1, 'darwin-arm64', '1.0.0', ['ghidra']]);
+    [1, 'darwin-arm64', packageVersion, ['ghidra']]);
   assert.deepEqual(inventory.links, [
     { path: 'ghidra/ghidra/LICENSE.alias', target: 'LICENSE' },
     { path: 'ghidra/ghidra/licenses.alias', target: 'licenses' },

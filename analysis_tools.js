@@ -31,6 +31,13 @@ const inferenceProperty = { type: 'object', properties: {
   holdout_samples: { type: 'array', maxItems: 64, items: bytesProperty, description: 'Independent validation messages; train and holdout combined are limited to 64 samples and 1 MiB.' },
   min_frames: { type: 'integer', minimum: 3, maximum: 64 }, max_candidates: { type: 'integer', minimum: 1, maximum: 8 }, max_scan_bytes: { type: 'integer', minimum: 1, maximum: 262144 }, max_work: { type: 'integer', minimum: 1, maximum: 2000000 },
 }, required: [], additionalProperties: false };
+const stateModelProperty = { type: 'object', properties: {
+  result_id: { type: 'string', description: 'For state_validate, saved state_infer producer report; reconstruction verifies the full model digest, never a truncated UI preview.' },
+  model: { type: 'string', enum: ['prefix-tree', 'merged-hypothesis'] },
+  merge: { type: 'string', enum: ['none', 'future-equivalent'] }, merge_depth: { type: 'integer', minimum: 1, maximum: 3 },
+  max_traces: { type: 'integer', minimum: 1, maximum: 256 }, max_events: { type: 'integer', minimum: 1, maximum: 8192 },
+  max_states: { type: 'integer', minimum: 2, maximum: 4096 }, max_work: { type: 'integer', minimum: 100, maximum: 2000000 },
+}, required: [], additionalProperties: false };
 
 /** Preserve complete reports on disk; return bounded, explicitly truncated model views. */
 export function compactAnalysis(value) {
@@ -190,18 +197,35 @@ export function createAnalysisService(mgr, cfg) {
         retainedRecordsAndBlobs: true, note: 'Archive removes reports from active pages; result IDs and data refs remain usable. Restore returns them to active pages.' };
     },
     result(id, select) { const record = artifacts.get(id); return { id: record.id, createdAt: record.createdAt, kind: record.kind, action: record.action, association: record.association, input: bindRefs(record.input, id), output: bindRefs(record.output, id), ...(record.keySource ? { keySource: record.keySource } : {}), ...compactAnalysis(bindRefs(selectResult(record, select), id)) }; },
+    observeNative(request, signal) { return jobs.run('vm-observations', request, signal); },
+    sampleVmRoles(request, signal) { return jobs.run('vm-role-samples', request, signal); },
+    selectVmFlow(request, signal) { return jobs.run('vm-flow-window', request, signal); },
+    replayVmFlowWitnesses(request, signal) { return jobs.run('vm-flow-witness-replay', request, signal); },
+    recurVmFlow(request, signal) { return jobs.run('vm-flow-recurrences', request, signal); },
+    selectVmHandlers(request, signal) { return jobs.run('vm-handler-windows', request, signal); },
+    assessVmHandler(request, signal) { return jobs.run('vm-handler-assessment', request, signal); },
     async execute(kind, args) {
       mgr.checkCancelled();
       if (args.action === 'result') {
-        if (args.recovery !== undefined || args.inference !== undefined) fail('INVALID_INPUT', 'Recovery and inference options are not used when reading a report');
+        if (args.recovery !== undefined || args.inference !== undefined || args.state_model !== undefined) fail('INVALID_INPUT', 'Recovery and inference options are not used when reading a report');
         if (kind === 'protocol' && (args.offset !== undefined || args.length !== undefined)) fail('INVALID_INPUT', 'Byte ranges are not used when reading a report');
         const record = artifacts.get(args.result_id);
         if (record.kind !== kind) fail('INVALID_REF', 'Result belongs to a different analysis lane');
         return this.result(args.result_id, args.select);
       }
       if (args.recovery !== undefined && (kind !== 'crypto' || args.action !== 'recover') || args.inference !== undefined && (kind !== 'protocol' || args.action !== 'infer')) fail('INVALID_INPUT', 'Recovery or inference options do not apply to this action');
+      const stateAction = kind === 'protocol' && ['state_infer', 'state_validate'].includes(args.action);
+      if (args.state_model !== undefined && !stateAction) fail('INVALID_INPUT', 'State model options do not apply to this action');
+      if (stateAction && [args.offset, args.length, args.max_packets, args.max_frames, args.max_reassembly_bytes].some(value => value !== undefined)) fail('INVALID_INPUT', 'State actions consume a complete JSON trace manifest, without byte slicing or capture parsing options');
       if (kind === 'crypto' && args.recipe !== undefined && args.action !== 'transform' || kind === 'protocol' && (args.schema !== undefined || args.framing !== undefined) && !['capture', 'decode'].includes(args.action)) fail('INVALID_INPUT', 'Recipe, schema or framing options do not apply to this action');
-      const captured = await input(args, kind);
+      let prior;
+      if (kind === 'protocol' && args.action === 'state_validate') {
+        const producer = artifacts.get(args.state_model?.result_id);
+        if (producer.kind !== 'protocol' || producer.action !== 'state_infer' || producer.result?.schemaVersion !== 'ig5.protocol-state.v1') fail('INVALID_REF', 'State validation requires a saved protocol state_infer report');
+        const state = producer.result.state;
+        prior = { training: state.training, options: state.options, observedDigest: state.modelDigest, mergedDigest: state.mergedDigest, resultId: producer.id };
+      }
+      const captured = await input(args, kind, args.input, stateAction ? 1024 * 1024 : INPUT_LIMIT[kind]);
       mgr.checkCancelled();
       if (kind === 'protocol') {
         // The complete source is read under its existing limit before slicing. A range cannot
@@ -237,7 +261,7 @@ export function createAnalysisService(mgr, cfg) {
       }
       const request = kind === 'crypto'
         ? { op: args.action, input: { encoding: 'hex', data: captured.data.toString('hex') }, recipe, recovery, expected: args.expected, offset: args.offset, length: args.length, output_limit: args.output_limit, preview_limit: args.preview_limit }
-        : { action: args.action, data: captured.data.toString('hex'), encoding: 'hex', schema: args.schema, framing: args.framing, inference: args.inference, maxPackets: args.max_packets, maxFrames: args.max_frames, maxReassemblyBytes: args.max_reassembly_bytes, maxPreviewBytes: args.preview_limit };
+        : { action: args.action, data: captured.data.toString('hex'), encoding: 'hex', schema: args.schema, framing: args.framing, inference: args.inference, state_model: args.state_model, prior, maxPackets: args.max_packets, maxFrames: args.max_frames, maxReassemblyBytes: args.max_reassembly_bytes, maxPreviewBytes: args.preview_limit };
       const value = await jobs.run(kind, request, mgr.scope?.getStore()?.signal);
       mgr.checkCancelled();
       const inputRef = artifacts.put(captured.data);
@@ -259,8 +283,8 @@ export function defineAnalysisTools(mgr, cfg, render) {
       action: { type: 'string', enum: ['inspect', 'transform', 'recover', 'verify', 'result'] }, offset: { type: 'number' }, length: { type: 'number' }, output_limit: { type: 'number' }, expected: bytesProperty, recovery: recoveryProperty,
       recipe: { type: 'object', properties: { kind: { type: 'string', enum: ['xor', 'aes-cbc', 'aes-ctr', 'aes-gcm', 'gzip', 'zlib'] }, key: bytesProperty, key_ref: keyRefProperty, iv: bytesProperty, tag: bytesProperty, aad: bytesProperty, padding: { type: 'string', enum: ['none', 'pkcs7'] }, key_offset: { type: 'number', description: 'Explicit repeating XOR key start offset' } }, required: ['kind'], additionalProperties: false },
     }),
-    tool('ig5_protocol', 'protocol', 'Inspect, parse PCAP/PCAPNG, reassemble directions or decode schemas. action=infer ranks bounded framing and field hypotheses from explicit messages/streams/captures, preserving unknown boundaries and holes; independent holdout validation is reported separately. Candidate framing/schema can be reused by decode. Field meanings, encryption and protocol state machines are not automatically proven. No live capture, network sends or sample execution. action=result reads a prior report.', {
-      action: { type: 'string', enum: ['inspect', 'capture', 'decode', 'infer', 'result'] }, offset: { type: 'integer', minimum: 0, description: 'Relative input-byte offset; capture the bounded full source first, then select this range. Useful with infer candidate.decodeInput.startOffset.' }, length: { type: 'integer', minimum: 0, description: 'Selected byte length; preserve skipped prefix/tail in the source reference. Useful with infer candidate.decodeInput.byteLength.' }, max_packets: { type: 'number' }, max_frames: { type: 'number' }, max_reassembly_bytes: { type: 'number' }, inference: inferenceProperty,
+    tool('ig5_protocol', 'protocol', 'Inspect bytes, parse PCAP/PCAPNG, reassemble directions, decode schemas or infer bounded framing/field hypotheses. state_infer consumes a <=1 MiB JSON manifest {version:1,traces:[{id,start:"session-start"|"unknown",complete:boolean,events:[{direction:"client_to_server"|"server_to_client",symbol,sourceId?,complete?}]}],holdout?:[]} through the existing input path/ref/bytes. It builds an observed prefix tree and optional future-equivalence merge hypothesis. state_validate replays new manifest.traces against state_model.result_id; reports accepted/rejected/unknown, overlap and counterexamples separately from training. Explicit session boundaries are required; TCP does not establish them. Models do not prove hidden server state, semantic meanings or complete protocol behavior. No network sends or sample execution. action=result reads a saved report; use select=state.holdout or state.observedModel.states.0 for bounded detail.', {
+      action: { type: 'string', enum: ['inspect', 'capture', 'decode', 'infer', 'state_infer', 'state_validate', 'result'] }, offset: { type: 'integer', minimum: 0, description: 'Relative input-byte offset; capture the bounded full source first, then select this range. Useful with infer candidate.decodeInput.startOffset.' }, length: { type: 'integer', minimum: 0, description: 'Selected byte length; preserve skipped prefix/tail in the source reference. Useful with infer candidate.decodeInput.byteLength.' }, max_packets: { type: 'number' }, max_frames: { type: 'number' }, max_reassembly_bytes: { type: 'number' }, inference: inferenceProperty, state_model: stateModelProperty,
       schema: { type: 'object', properties: { name: { type: 'string' }, fields: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, offset: { type: 'number' }, type: { type: 'string', enum: ['u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32', 'i64', 'bytes', 'utf8', 'varint'] }, length: { type: 'number' }, endian: { type: 'string', enum: ['little', 'big'] } }, required: ['name', 'offset', 'type'], additionalProperties: false } } }, required: ['fields'], additionalProperties: false },
       framing: { type: 'object', properties: { type: { type: 'string', enum: ['fixed', 'length-prefix', 'delimiter', 'varint-prefix', 'tlv'] }, delimiterHex: { type: 'string', enum: ['0a', '0d0a'] }, includeDelimiter: { type: 'boolean' }, length: { type: 'number' }, offset: { type: 'number' }, size: { type: 'number', enum: [1, 2, 4] }, maxBytes: { type: 'integer', minimum: 1, maximum: 5 }, headerBytesAfterLength: { type: 'integer', minimum: 0, maximum: 4096 }, typeSize: { type: 'integer', enum: [1, 2] }, lengthSize: { type: 'integer', enum: [1, 2, 4] }, endian: { type: 'string', enum: ['little', 'big'] }, headerLength: { type: 'number' }, lengthIncludesHeader: { type: 'boolean' }, adjustment: { type: 'number' } }, required: ['type'], additionalProperties: false },
     }),
