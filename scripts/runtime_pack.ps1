@@ -129,6 +129,43 @@ function Get-IG5RelativePath {
     return $full.Substring($base.Length).Replace('\', '/')
 }
 
+function Assert-IG5RuntimeExtensions {
+    param([Parameter(Mandatory)][string]$Root)
+    # New optional runtimes have independent fixed manifests. Never rewrite the
+    # original ghidra/x64dbg donor manifest or silently accept arbitrary extras.
+    $pins = @{
+        mergen = @{ manifest='manifest.json'; sha256='1d63bc53c0a0f49e99163768d716727a4ea02056b4617165c18db20e21b28485' }
+        scyllahide = @{ manifest='ig5-manifest.json'; sha256='d6e2bb2f6c1ecb4a59a54a80c21a9475561b0fa877dbdc7b2a9c44e90d865a82' }
+    }
+    $records = @{}
+    foreach ($name in $pins.Keys) {
+        $directory = Join-Path $Root $name
+        if (-not (Test-IG5Path $directory)) { continue }
+        $manifestPath = Resolve-IG5PackPath $directory $pins[$name].manifest
+        if (-not (Test-IG5Path $manifestPath Leaf) -or (Get-IG5Hash $manifestPath) -cne $pins[$name].sha256) { throw "Optional runtime manifest pin mismatch: $name" }
+        $manifest = Read-IG5Text $manifestPath | ConvertFrom-Json
+        $rows = @($manifest.files)
+        if ($rows.Count -lt 1 -or $rows.Count -gt 32) { throw "Optional runtime inventory budget invalid: $name" }
+        $local = @{}
+        foreach ($row in $rows) {
+            $relative = [string]$row.path
+            if ($relative -notmatch '^[A-Za-z0-9_.-]+$' -or $relative -eq '.' -or $relative -eq '..' -or $relative -eq $pins[$name].manifest -or $local.ContainsKey($relative)) { throw "Optional runtime path invalid: $name" }
+            $file = Resolve-IG5PackPath $directory $relative
+            if (-not (Test-IG5Path $file Leaf) -or (New-Object IO.FileInfo (ConvertTo-IG5IOPath $file)).Length -ne [long]$row.bytes -or (Get-IG5Hash $file) -cne [string]$row.sha256) { throw "Optional runtime file pin mismatch: $name/$relative" }
+            $local[$relative] = $true
+            $records["$name/$relative"] = $row
+        }
+        $actual = @(Get-IG5PackFiles $directory)
+        if ($actual.Count -ne $rows.Count + 1) { throw "Optional runtime contains unregistered files: $name" }
+        foreach ($file in $actual) {
+            $relative = Get-IG5RelativePath $directory $file.FullName
+            if ($relative -ne $pins[$name].manifest -and -not $local.ContainsKey($relative)) { throw "Optional runtime contains unregistered files: $name/$relative" }
+        }
+        $records["$name/$($pins[$name].manifest)"] = @{path=$pins[$name].manifest;bytes=(New-Object IO.FileInfo (ConvertTo-IG5IOPath $manifestPath)).Length;sha256=$pins[$name].sha256}
+    }
+    return $records
+}
+
 function Assert-IG5RuntimePack {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Root)
@@ -210,7 +247,8 @@ function Assert-IG5RuntimePack {
             }
         }
     }
-    $actual = @(Get-IG5PackFiles $base)
+    $extensions = Assert-IG5RuntimeExtensions $base
+    $actual = @(Get-IG5PackFiles $base | Where-Object { -not $extensions.ContainsKey((Get-IG5RelativePath $base $_.FullName)) })
     $runtimeChecked = 0
     foreach ($file in $actual) {
         $relative = Get-IG5RelativePath $base $file.FullName

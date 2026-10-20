@@ -24,6 +24,10 @@ try {
     Check (Test-IG5ExcludedPath 'adapters/vmci/native/launcher.obj') 'guest launcher intermediate object must not be packaged'
     Check (-not (Test-IG5ExcludedPath 'third_party/sources/ghidra-master/Framework/scratch/source.c')) 'upstream source paths must retain their original names'
     Pass 'packaging excludes root experiments and local intermediate objects while preserving upstream source paths'
+    New-Item -ItemType Directory -Path (Join-Path $fixtureRoot 'optional-invalid\mergen') -Force | Out-Null
+    Put (Join-Path $fixtureRoot 'optional-invalid\mergen\manifest.json') '{"files":[]}'
+    Expect-Failure { Assert-IG5RuntimeExtensions (Join-Path $fixtureRoot 'optional-invalid') } 'manifest pin mismatch'
+    Pass 'optional runtimes cannot replace fixed manifests with self-authenticated inventories'
     foreach ($pair in @(@('1.0.0','1.0.0'), @('1.1.0','1.1.0'), @('1.0.0','1.1.0'))) {
         Check (Test-IG5RuntimeVersion $pair[0] $pair[1]) "Expected asset $($pair[0]) to support plugin $($pair[1])"
     }
